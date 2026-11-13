@@ -6,7 +6,15 @@ Convenção: [SemVer](https://semver.org/) (MAJOR.MINOR.PATCH). O número atual 
 O versionamento começou nesta entrada (1.3.0) — mudanças anteriores a ela não foram
 catalogadas retroativamente.
 
-## [1.9.8] — 2026-11-13
+## [1.9.9] — 2026-11-13
+
+### Alterado
+- Reaproveitamento da consulta do CPF no SAT generalizado: antes só valia entre o
+  levantamento e o download imediatamente seguinte, na mesma passada da fila (15 min,
+  uso único). Agora, toda vez que o painel for abrir uma consulta por CPF, ele checa AO
+  VIVO se a janela do SAT já está mostrando aquele CPF (sem depender de nenhuma flag em
+  memória) — e se estiver, pula a nova consulta e o CAPTCHA, não importa como chegou
+  àquele estado (retomada depois de interrupção, nova tentativa da fila, etc.).
 
 ### Alterado
 - Modal de "Encerrar painel": título "Encerrar Painel", texto simplificado para "Confirma

@@ -553,18 +553,17 @@ def rotina_ativa() -> dict:
     return dict(_ROTINA_ATIVA)
 
 
-# Consulta deixada aberta pelo LEVANTAMENTO: o "Baixar mais" logo em seguida, no mesmo
-# CPF, segue na tela do cidadão que já está na janela do SAT — sem nova consulta por CPF
-# e sem novo CAPTCHA (menos requisições ao antirrobô). Vale uma vez e por pouco tempo; se
-# a tela não estiver mais lá, consulta normal.
-_CONSULTA_ABERTA = {"cpf": "", "ate": 0.0}
-_CONSULTA_VALIDADE_S = 15 * 60
+# Reaproveitamento de consulta: sempre que a janela do SAT já estiver mostrando os dados
+# do MESMO CPF que se está prestes a consultar — não importa por que chegou lá (levantamento
+# seguido de download na mesma passada da fila, retomada depois de uma interrupção, nova
+# tentativa da fila, etc.) — pula a nova consulta por CPF e o novo CAPTCHA (menos
+# requisições ao antirrobô, menos demora). Checa o estado AO VIVO da página a cada
+# chamada, sem depender de nenhuma flag em memória — pedido do usuário, 2026-11-13.
 
 
-async def _reaproveitar_consulta(page, dig: str) -> bool:
-    if _CONSULTA_ABERTA["cpf"] != dig or time.monotonic() > _CONSULTA_ABERTA["ate"]:
-        return False
-    _CONSULTA_ABERTA.update(cpf="", ate=0.0)  # uma vez só
+async def _pagina_ja_mostra_cpf(page, dig: str) -> bool:
+    """True se a página do SAT, agora, já está na consulta deste CPF (mesma aba/sessão da
+    janela controlada via CDP) — ver comentário acima."""
     try:
         if not _status_dict(page.url)["logado"]:
             return False
@@ -1812,10 +1811,10 @@ async def _abrir_consulta_cpf(page, cpf: str, reg, out: dict):
     aparecem; senão já gera o evento final (done) com o motivo."""
     out["ok"] = False
     dig = "".join(c for c in cpf if c.isdigit())
-    if await _reaproveitar_consulta(page, dig):
+    if await _pagina_ja_mostra_cpf(page, dig):
         with contextlib.suppress(Exception):
             await page.bring_to_front()
-        yield reg("Reaproveitando a consulta do Levantamento — sem nova consulta por CPF e sem CAPTCHA.", "ok")
+        yield reg("Página do SAT já está na consulta deste CPF — sem nova consulta nem CAPTCHA.", "ok")
         out["ok"] = True
         return
     async for ev in _aguardar_intervalo_cpf(page, reg):
@@ -2288,13 +2287,11 @@ async def levantar_cidadao_stream(cpf: str, nome: str, pasta_destino: str,
             yield reg(f"  ✓ Tarefas PAT: {len(vistos)} tarefa(s)", "ok" if vistos else "muted")
 
         concluiu = True
-        _CONSULTA_ABERTA.update(cpf="".join(c for c in cpf if c.isdigit()),
-                                ate=time.monotonic() + _CONSULTA_VALIDADE_S)
         n_disp = sum(1 for it in itens if it["status"] == "disponivel")
         yield {"done": True, "resultado": {"ok": True, "detalhe":
                f"Levantamento concluído: {n_disp} documento(s) disponível(is) no SAT, "
-               f"além dos {len(_GRUPO1)} do Grupo 1 a verificar. Escolha no \"Baixar mais\" — a consulta "
-               f"fica aberta {_CONSULTA_VALIDADE_S // 60} min (sem novo CAPTCHA).", "consulta_aberta": True}}
+               f"além dos {len(_GRUPO1)} do Grupo 1 a verificar. Escolha no \"Baixar mais\" — enquanto a "
+               f"janela do SAT continuar nesta consulta, o próximo passo reaproveita (sem novo CAPTCHA)."}}
     except _EncerrarFluxo:
         yield reg("■ Levantamento encerrado pelo usuário (fica incompleto).", "novo")
         yield {"done": True, "resultado": {"ok": False, "encerrado": True,
