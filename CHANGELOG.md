@@ -6,6 +6,24 @@ Convenção: [SemVer](https://semver.org/) (MAJOR.MINOR.PATCH). O número atual 
 O versionamento começou nesta entrada (1.3.0) — mudanças anteriores a ela não foram
 catalogadas retroativamente.
 
+## [1.9.8] — 2026-11-13
+
+### Alterado
+- Modal de "Encerrar painel": título "Encerrar Painel", texto simplificado para "Confirma
+  fechamento do painel? Os dados já salvos permanecem em disco.", botão de confirmação
+  renomeado para "Sim" e na cor padrão do sistema (azul), não mais vermelho.
+
+## [1.9.6] — 2026-11-13
+
+### Corrigido
+- **PAJ ficava "Incompleto" para sempre mesmo sem nada pendente**: a correção do
+  levantamento pendente por antirrobô (1.9.0) acrescentava os itens de verdade
+  descobertos na nova tentativa, mas nunca removia o placeholder antigo
+  "levantamento: antirobo" quando o tipo era resolvido — esse placeholder sozinho já
+  bastava para `_download_tem_falha` considerar o PAJ incompleto para sempre, mesmo
+  depois de o usuário decidir (e salvar) que não quer mais os itens encontrados. Agora o
+  placeholder é removido assim que o tipo deixa de ser reportado como bloqueado.
+
 ## [1.9.5] — 2026-11-13
 
 ### Alterado

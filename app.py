@@ -27,7 +27,7 @@ PID_FILE = BASE_DIR / ".server.pid"
 LOGS_DIR = BASE_DIR / "logs"
 PORT = 8003
 
-APP_VERSION = "1.9.5"
+APP_VERSION = "1.9.8"
 
 
 def _configurar_logging() -> None:

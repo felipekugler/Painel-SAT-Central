@@ -400,10 +400,10 @@
         };
         window.encerrarPainel = async function () {
             if (!(await window.confirmarModal({
-                    titulo: 'Encerrar o painel?',
-                    mensagem: 'Isso vai desligar o servidor. Os dados já salvos permanecem em disco.\n\n'
-                            + 'Para usar de novo, abra o Painel SAT Central pelo atalho.',
-                    confirmar: 'Encerrar', perigo: true }))) return;
+                    titulo: 'Encerrar Painel',
+                    mensagem: 'Confirma fechamento do painel?\n'
+                            + 'Os dados já salvos permanecem em disco.',
+                    confirmar: 'Sim' }))) return;
             var btn = document.getElementById('btn-encerrar-painel');
             if (btn) { btn.disabled = true; btn.textContent = 'Encerrando…'; }
             try { await fetch('/api/encerrar', { method: 'POST' }); } catch (e) { /* esperado */ }

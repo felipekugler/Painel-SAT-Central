@@ -395,8 +395,15 @@ def _mesclar_novo_levantamento_em_batimento(pasta: Path, tipos_sel: list[str] | 
     lista de batimento já existente: só acrescenta itens (key, sub) novos que vieram de
     um tipo que tinha ficado pendente por antirrobô, e só substitui o(s) placeholder(s)
     que ainda estavam "levantamento: antirobo" — nunca mexe no que já foi decidido
-    (incluído/excluído, manual ou automaticamente) ou já baixado. Retorna True se algo
-    mudou."""
+    (incluído/excluído, manual ou automaticamente) ou já baixado.
+
+    Quando um tipo pendente é RESOLVIDO (a nova tentativa revela itens de verdade, em vez
+    de continuar reportando antirrobô), o placeholder antigo "levantamento: antirobo"
+    (key, sub="") é REMOVIDO da lista — senão ele fica marcado como pendente para sempre
+    e `_tem_levantamento_pendente`/`_download_tem_falha` nunca voltam a False, mesmo
+    depois de o usuário decidir e salvar a seleção dos itens de verdade (bug identificado
+    2026-11-13: PAJ ficava "Incompleto" para sempre mesmo sem nada mais pendente). Retorna
+    True se algo mudou."""
     bat = ler_batimento(pasta)
     itens = bat.get("itens") or []
     if not itens:
@@ -405,6 +412,7 @@ def _mesclar_novo_levantamento_em_batimento(pasta: Path, tipos_sel: list[str] | 
     tipos_pendentes = {it.get("key", "") for it in itens
                        if (it.get("detalhe") or "").startswith("levantamento: antirobo")}
     novo_bruto = _montar_batimento_inicial(pasta, tipos_sel, filtros)
+    chaves_novo = {(n.get("key", ""), n.get("sub", "")) for n in novo_bruto}
     mudou = False
     for novo in novo_bruto:
         chave = (novo.get("key", ""), novo.get("sub", ""))
@@ -417,7 +425,18 @@ def _mesclar_novo_levantamento_em_batimento(pasta: Path, tipos_sel: list[str] | 
             itens.append(novo)
             idx[chave] = len(itens) - 1
             mudou = True
+    for key in tipos_pendentes:
+        chave_placeholder = (key, "")
+        i = idx.get(chave_placeholder)
+        if i is None or i >= len(itens) or itens[i] is None:
+            continue
+        if not (itens[i].get("detalhe") or "").startswith("levantamento: antirobo"):
+            continue
+        if chave_placeholder not in chaves_novo:  # tipo resolvido — não bloqueia mais
+            itens[i] = None
+            mudou = True
     if mudou:
+        itens = [it for it in itens if it is not None]
         _salvar_batimento(pasta, itens)
     return mudou
 
