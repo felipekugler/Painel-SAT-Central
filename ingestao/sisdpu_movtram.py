@@ -157,43 +157,6 @@ _JS_CLICA_BTN_CONCLUIR = r"""() => {
     if (!b) return false; b.click(); return true;
 }"""
 
-# Extrai a caixa de entrada do usuário por linha (data-rk = id_tramite). Colunas do
-# SISDPU: [checkbox · Operações · Processo · Assistido · Data de Envio · Remetente ·
-# Prazo · Descrição · —]. Robusto: captura `linha_texto` (todas as células) para o
-# filtro por descrição não depender do índice exato.
-_JS_CAIXA_USUARIO = r"""() => {
-    const t = document.querySelector('[id="tabView:caixaEntradaTab1Form:tramites"]');
-    if (!t) return {encontrado:false, itens:[]};
-    const norm = s => (s||'').replace(/\s+/g,' ').trim();
-    const itens = [];
-    for (const tr of t.querySelectorAll('tbody tr[data-rk]')) {
-        const idt = tr.getAttribute('data-rk') || '';
-        const tds = [...tr.querySelectorAll(':scope > td')];
-        let pIdx=-1, linkDet=null;
-        for (let i=0;i<tds.length;i++){ const a=tds[i].querySelector('a[href*="detalhamentoProcesso"]'); if(a){pIdx=i;linkDet=a;break;} }
-        if (pIdx<0) continue;
-        const textoProc = norm(linkDet.textContent);
-        const mPaj = textoProc.match(/(\d{4}\/\d{3}-\d+)\s*(.*)$/);
-        const paj = mPaj?mPaj[1]:'';
-        const assistidoInline = mPaj?norm(mPaj[2]).replace(/^\(\s*/,'').replace(/\s*\)$/,''):'';
-        const href = linkDet.getAttribute('href')||'';
-        const mId = href.match(/[?&]id=(\d+)/);
-        const idProc = mId?mId[1]:'';
-        const cell = i => tds[i]?norm(tds[i].textContent):'';
-        itens.push({
-            id_tramite: idt, id: idProc, paj,
-            assistido: cell(pIdx+1) || assistidoInline,
-            data_envio: cell(pIdx+2),
-            remetente: cell(pIdx+3),
-            prazo: cell(pIdx+4),
-            descricao: cell(pIdx+5),
-            linha_texto: tds.map(td=>norm(td.textContent)).filter(Boolean).join(' | '),
-            url_detalhe: href ? (href.startsWith('http')?href:location.origin+href) : '',
-        });
-    }
-    return {encontrado:true, itens};
-}"""
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -206,13 +169,14 @@ def _norm_nome(s: str) -> str:
     return re.sub(r"\s+", " ", s).strip().upper()
 
 
-async def _eval_seguro(page, js: str, tentativas: int = 5) -> dict:
+async def _eval_seguro(page, js: str, arg=None, tentativas: int = 5) -> dict:
     """page.evaluate tolerante a navegação (o contexto pode ser destruído por postback
-    JSF no meio do evaluate) — re-tenta após a navegação assentar."""
+    JSF no meio do evaluate) — re-tenta após a navegação assentar. `arg`, se informado
+    (!= None), é repassado como argumento da função JS (ex.: nome da caixa de grupo)."""
     ultimo = None
     for _ in range(tentativas):
         try:
-            return await page.evaluate(js)
+            return await (page.evaluate(js, arg) if arg is not None else page.evaluate(js))
         except Exception as e:  # noqa: BLE001
             msg = str(e).lower()
             if "context was destroyed" in msg or "navigation" in msg or "execution context" in msg:
@@ -224,18 +188,33 @@ async def _eval_seguro(page, js: str, tentativas: int = 5) -> dict:
             raise
     if ultimo:
         raise ultimo
-    return await page.evaluate(js)
+    return await (page.evaluate(js, arg) if arg is not None else page.evaluate(js))
 
 
 async def _resolver_conflito_login(page) -> bool:
-    """Se o diálogo de conflito de sessão estiver VISÍVEL, clica 'Desbloquear' (assume
-    a sessão) e aguarda sumir. Retorna True se não há conflito (ou foi resolvido)."""
+    """Compatível com o uso antigo (só `if not await _resolver_conflito_login(page): ...`).
+    Veja `_resolver_conflito_login2` — usa aqui o mesmo resultado, descartando o 2º valor."""
+    ok, _havia = await _resolver_conflito_login2(page)
+    return ok
+
+
+async def _resolver_conflito_login2(page) -> tuple[bool, bool]:
+    """Se o diálogo de conflito de sessão estiver VISÍVEL (outra aba/computador logado
+    com o MESMO usuário — comum quando o Defensor acompanha o SISDPU na própria janela
+    enquanto o painel também usa a sessão headless), clica 'Desbloquear' (assume a
+    sessão) e aguarda a página assentar de verdade (AJAX do PrimeFaces, não só o modal
+    sumir). Retorna (ok, havia_conflito): `ok` = False só se o conflito ficou sem
+    resolver; `havia_conflito` = True sempre que um conflito foi detectado (resolvido ou
+    não) — o chamador deve então RELER a página do zero (não confiar no DOM atual), pois
+    o "Desbloquear" pode ter deixado a tela num estado intermediário (ex.: uma tabela de
+    caixa de grupo lida nesse instante aparecia com só 1 de 5 PAJs, sem nenhum erro —
+    bug corrigido em 2026-11-10)."""
     conflito = await _eval_seguro(page, _JS_CONFLITO_LOGIN)
     if not conflito:
         with contextlib.suppress(Exception):
             from services import conexao_service
             conexao_service.marcar_conectado()
-        return True
+        return True, False
     _log.info("movtram: conflito de sessão detectado — clicando 'Desbloquear'.")
     btn = page.locator('[id$="confirmTramitacao"]').first
     with contextlib.suppress(Exception):
@@ -243,12 +222,16 @@ async def _resolver_conflito_login(page) -> bool:
             await btn.click(timeout=5000)
     with contextlib.suppress(Exception):
         await page.wait_for_selector('[id$="confirmDialogLogin_modal"]', state="hidden", timeout=8000)
-    await page.wait_for_timeout(300)
+    # O "Desbloquear" dispara um postback do PrimeFaces que pode demorar bem mais que
+    # os antigos 300ms fixos — espera o AJAX de verdade assentar antes de confiar no DOM.
+    with contextlib.suppress(Exception):
+        await _wait_pf_ajax(page, timeout=10000)
+    await page.wait_for_timeout(800)
     resolvido = not await _eval_seguro(page, _JS_CONFLITO_LOGIN)
     with contextlib.suppress(Exception):
         from services import conexao_service
         conexao_service.marcar_conectado() if resolvido else conexao_service.marcar_conflito(_MSG_CONFLITO_SESSAO)
-    return resolvido
+    return resolvido, True
 
 
 async def _ler_pajs_lista(page, input_id: str) -> list[str]:
@@ -363,24 +346,198 @@ async def _anexar_documentos_movimentacao(page, anexos: list[dict], tipo_arquivo
 
 
 # ---------------------------------------------------------------------------
-# Leitura estruturada da caixa de entrada do usuário
+# Leitura estruturada de UMA caixa de entrada de GRUPO (ex.: "1 - PREV - SAT"), usada
+# pela fila automática — a origem dos PAJs é uma caixa de grupo específica, NÃO a caixa
+# pessoal do usuário. Porta de Painel Comunicações (ingestao/sisdpu_client.py), mesmo
+# padrão validado: a aba "Caixa de Entrada do Grupo" empilha um datatable por caixa de
+# grupo a que o usuário tem acesso, cada um com cabeçalho <strong>NOME DO GRUPO</strong>.
 # ---------------------------------------------------------------------------
-async def listar_caixa_estruturada() -> dict:
-    """Lê a caixa de entrada do usuário por linha (tabela do usuário), com id_tramite
-    (data-rk), id (id_processo), paj, assistido, descrição e linha_texto (todas as
-    células). Retorna {ok, itens}."""
-    await _ensure_logged_in()
-    page = await _get_page()
-    await page.goto(f"{SISDPU_URL}/pages/caixaentrada/caixaEntrada.xhtml",
-                    wait_until="domcontentloaded", timeout=30000)
+CAIXA_GRUPO_SEED = "(descoberta de caixas)"  # não casa com nenhuma caixa real — só para
+                                             # harvestar grupos_disponiveis (descoberta)
+
+_JS_CAIXA_GRUPO = r"""(nomeGrupo) => {
+    const norm = (s) => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+    const alvo = norm(nomeGrupo);
+    const headers = Array.from(document.querySelectorAll('.ui-datatable-header'));
+    const disponiveis = [];
+    let tabelaAlvo = null;
+    let matchExato = false;
+    for (const h of headers) {
+        const strong = h.querySelector('strong');
+        const nome = strong ? strong.textContent.trim() : '';
+        if (!nome) continue;
+        disponiveis.push(nome);
+        if (matchExato) continue;
+        if (norm(nome) === alvo) { tabelaAlvo = h.closest('.ui-datatable'); matchExato = true; }
+        else if (tabelaAlvo === null && norm(nome).includes(alvo)) { tabelaAlvo = h.closest('.ui-datatable'); }
+    }
+    const itens = [];
+    if (tabelaAlvo) {
+        for (const tr of tabelaAlvo.querySelectorAll('tbody tr[data-rk]')) {
+            const idTramite = tr.getAttribute('data-rk') || '';
+            const tds = Array.from(tr.querySelectorAll(':scope > td'));
+            let pIdx = -1, linkDet = null;
+            for (let i = 0; i < tds.length; i++) {
+                const a = tds[i].querySelector('a[href*="detalhamentoProcesso"]');
+                if (a) { pIdx = i; linkDet = a; break; }
+            }
+            if (pIdx < 0) continue;
+            const textoProc = (linkDet.textContent || '').replace(/\s+/g, ' ').trim();
+            const mPaj = textoProc.match(/(\d{4}\/\d{3}-\d+)\s*(.*)$/);
+            const paj = mPaj ? mPaj[1] : '';
+            let oficio = mPaj ? mPaj[2].trim() : '';
+            oficio = oficio.replace(/^\(\s*/, '').replace(/\s*\)$/, '').trim();
+            const href = linkDet.getAttribute('href') || '';
+            const mId = href.match(/[?&]id=(\d+)/);
+            const idProc = mId ? mId[1] : '';
+            const urlDet = href ? (href.startsWith('http') ? href : (location.origin + href)) : '';
+            const cellText = (i) => (tds[i] ? (tds[i].textContent || '').replace(/\s+/g, ' ').trim() : '');
+            const cellRich = (i) => {
+                const td = tds[i]; if (!td) return '';
+                const txt = (td.textContent || '').replace(/\s+/g, ' ').trim();
+                const ttl = (td.getAttribute('title') || '').replace(/\s+/g, ' ').trim();
+                return /\d{2}:\d{2}/.test(ttl) ? ttl : txt;
+            };
+            itens.push({
+                id_tramite: idTramite, id: idProc, paj: paj, oficio_origem: oficio,
+                remetente: cellText(pIdx + 1), data_envio: cellRich(pIdx + 2),
+                prazo: cellText(pIdx + 3), url_detalhe: urlDet,
+                linha_texto: tds.map(td => (td.textContent || '').replace(/\s+/g, ' ').trim())
+                               .filter(Boolean).join(' | '),
+            });
+        }
+    }
+    return { encontrado: tabelaAlvo !== null, grupos_disponiveis: disponiveis, itens: itens };
+}"""
+
+# Lê o popup "Detalhes do trâmite" (já aberto) — a linha da caixa de GRUPO não traz a
+# descrição do trâmite nem o assistido (só Processo/Remetente/Data de Envio/Prazo); a
+# descrição do trâmite só existe aqui (não é usada pela fila automática — basta o PAJ
+# estar na caixa —, mas fica disponível via `enriquecer=True` para outros usos).
+_JS_POPUP_TRAMITE = r"""() => {
+    const d = document.querySelector('[id="formC:tramiteDetalhamentoDlg"]');
+    if (!d) return {};
+    const t = (d.innerText || '').replace(/\r/g, '');
+    const dt = t.match(/(\d{2}\/\d{2}\/\d{4}\s+\d{2}:\d{2}:\d{2})/);
+    const ehRotulo = (v) => /^(Assistido|Atribui[çc][ãa]o|Data do tr[âa]mite|Situa[çc][ãa]o|Órg[ãa]o)\s*(\(s\))?\s*:/i.test(v);
+    const pega = (rot) => {
+        const m = t.match(new RegExp(rot + '\\s*:?\\s*\\n\\s*([^\\n]+)', 'i'));
+        if (!m) return '';
+        const v = m[1].trim();
+        return ehRotulo(v) ? '' : v;
+    };
+    return {
+        data_envio: dt ? dt[1] : '',
+        descricao_tramite: pega('Descri[çc][ãa]o do tr[âa]mite'),
+        atribuicao: pega('Atribui[çc][ãa]o'),
+    };
+}"""
+
+
+async def _ler_popup_tramite(page, id_tramite: str) -> dict:
+    """Abre o popup "Detalhes do trâmite" de UMA tramitação (clique no ícone da coluna
+    Detalhes), lê data-hora/descrição/atribuição e FECHA o diálogo (é modal, senão
+    bloqueia o próximo clique). Best-effort: erro → {}."""
+    clicou = await page.evaluate(
+        """(idt) => {
+            const tr = document.querySelector('tr[data-rk="' + idt + '"]');
+            if (!tr) return false;
+            const tds = [...tr.querySelectorAll(':scope > td')];
+            const a = tds[1] && tds[1].querySelector('a');
+            if (!a) return false;
+            a.click();
+            return true;
+        }""",
+        id_tramite,
+    )
+    if not clicou:
+        return {}
     await _wait_pf_ajax(page, timeout=10000)
-    await page.wait_for_timeout(800)
-    if not await _resolver_conflito_login(page):
-        return {"ok": False, "detalhe": _MSG_CONFLITO_SESSAO, "itens": []}
-    dados = await _eval_seguro(page, _JS_CAIXA_USUARIO)
-    itens = dados.get("itens", []) if isinstance(dados, dict) else []
-    _log.info("listar_caixa_estruturada: %d item(ns) na caixa do usuário.", len(itens))
-    return {"ok": True, "itens": itens}
+    await page.wait_for_timeout(500)
+    dados = await page.evaluate(_JS_POPUP_TRAMITE)
+    with contextlib.suppress(Exception):
+        await page.evaluate(
+            """() => {
+                const d = document.querySelector('[id="formC:tramiteDetalhamentoDlg"]');
+                const x = d && d.querySelector('.ui-dialog-titlebar-close');
+                if (x) x.click();
+            }"""
+        )
+    await page.wait_for_timeout(300)
+    return dados or {}
+
+
+async def listar_caixa_grupo(nome_grupo: str = CAIXA_GRUPO_SEED, enriquecer: bool = False) -> dict:
+    """Lista os PAJs de UMA caixa de entrada de GRUPO (ex.: "1 - PREV - SAT"), na aba
+    "Caixa de Entrada do Grupo" do SISDPU — distinta da caixa pessoal do usuário. Essa
+    aba empilha um datatable por caixa de grupo a que o usuário tem acesso, cada um com
+    cabeçalho <strong>NOME DO GRUPO</strong>; localiza o datatable cujo cabeçalho casa
+    com `nome_grupo` (match exato preferencial, senão substring) e extrai as linhas.
+
+    A linha NÃO traz a descrição do trâmite nem o assistido (só Processo/Remetente/Data
+    de Envio/Prazo) — a fila automática não precisa de nenhum dos dois (basta o PAJ
+    estar na caixa). `enriquecer=True` abre o popup "Detalhes do trâmite" de CADA item
+    para completar essa descrição, se algum outro uso precisar dela — custa ~1-2s/item.
+
+    Retorna {ok, encontrado, grupos_disponiveis, itens, detalhe}. `grupos_disponiveis`
+    traz TODOS os nomes de caixa de grupo vistos na página (descoberta), independente de
+    `nome_grupo` ter sido encontrado."""
+    await _ensure_logged_in()
+    # PAGE_LOCK: a page do SISDPU é compartilhada (fila automática, "Sincronizar caixa"
+    # manual, "Adicionar PAJ" etc. podem rodar ao mesmo tempo) — sem o lock, uma chamada
+    # concorrente podia navegar a page no meio desta leitura e corromper o resultado
+    # (ex.: a tabela voltando com só 1 PAJ em vez dos 5 que estavam na caixa).
+    async with _sc.PAGE_LOCK:
+        page = await _get_page()
+        itens: list[dict] = []
+        grupos: list[str] = []
+        encontrado = False
+        # Até 2 tentativas: se um conflito de sessão (outro login simultâneo com o MESMO
+        # usuário — ex.: o Defensor acompanhando o SISDPU na própria janela) for resolvido
+        # NA 1ª passada, a página pode ter ficado num estado intermediário (o "Desbloquear"
+        # dispara um postback) — descarta essa leitura e relê do zero, em vez de confiar
+        # num DOM que pode estar incompleto (ex.: a tabela "sumindo" PAJs sem erro nenhum).
+        for tentativa in range(2):
+            await page.goto(f"{SISDPU_URL}/pages/caixaentrada/caixaEntrada.xhtml",
+                            wait_until="domcontentloaded", timeout=30000)
+            await _wait_pf_ajax(page, timeout=10000)
+            await page.wait_for_timeout(800)
+            ok_conflito, havia_conflito = await _resolver_conflito_login2(page)
+            if not ok_conflito:
+                return {"ok": False, "detalhe": _MSG_CONFLITO_SESSAO, "encontrado": False,
+                        "grupos_disponiveis": [], "itens": []}
+            await page.evaluate(_JS_ATIVA_ABA_GRUPO)
+            await _wait_pf_ajax(page, timeout=10000)
+            await page.wait_for_timeout(1200)
+
+            resultado = await _eval_seguro(page, _JS_CAIXA_GRUPO, nome_grupo or CAIXA_GRUPO_SEED)
+            resultado = resultado or {}
+            itens = resultado.get("itens", []) or []
+            grupos = resultado.get("grupos_disponiveis", []) or []
+            encontrado = bool(resultado.get("encontrado"))
+            if not havia_conflito or tentativa == 1:
+                break
+            _log.info("listar_caixa_grupo: houve conflito de sessão durante a leitura — relendo do zero.")
+
+        if enriquecer:
+            for it in itens:
+                if not it.get("id_tramite"):
+                    continue
+                try:
+                    extra = await _ler_popup_tramite(page, it["id_tramite"])
+                except Exception as e:  # noqa: BLE001
+                    _log.warning("listar_caixa_grupo: popup do trâmite %s falhou: %s", it.get("id_tramite"), e)
+                    extra = {}
+                if extra.get("data_envio"):
+                    it["data_envio"] = extra["data_envio"]
+                if extra.get("descricao_tramite"):
+                    it["descricao"] = extra["descricao_tramite"]
+                if extra.get("atribuicao"):
+                    it["atribuicao"] = extra["atribuicao"]
+
+    _log.info("listar_caixa_grupo(%r): encontrado=%s, %d item(ns), %d grupo(s) descoberto(s).",
+               nome_grupo, encontrado, len(itens), len(grupos))
+    return {"ok": True, "encontrado": encontrado, "grupos_disponiveis": grupos, "itens": itens}
 
 
 # Extração do DETALHAMENTO do PAJ (reusa os seletores do sincronizador): CPF na tabela
@@ -411,15 +568,20 @@ async def detalhes_paj(url_detalhe: str) -> dict:
     if not url_detalhe:
         return {}
     await _ensure_logged_in()
-    page = await _get_page()
     try:
-        await page.goto(url_detalhe, wait_until="domcontentloaded", timeout=30000)
-        await _wait_pf_ajax(page, timeout=12000)
-        await page.wait_for_timeout(600)
-        if not await _resolver_conflito_login(page):
+        async with _sc.PAGE_LOCK:  # page compartilhada — ver comentário em listar_caixa_grupo
+            page = await _get_page()
+            for tentativa in range(2):  # relê do zero se houve conflito — ver listar_caixa_grupo
+                await page.goto(url_detalhe, wait_until="domcontentloaded", timeout=30000)
+                await _wait_pf_ajax(page, timeout=12000)
+                await page.wait_for_timeout(600)
+                ok_conflito, havia_conflito = await _resolver_conflito_login2(page)
+                if not ok_conflito:
+                    return {}
+                dados = await _eval_seguro(page, _JS_DETALHE_PAJ)
+                if not havia_conflito or tentativa == 1:
+                    return dados if isinstance(dados, dict) else {}
             return {}
-        dados = await _eval_seguro(page, _JS_DETALHE_PAJ)
-        return dados if isinstance(dados, dict) else {}
     except Exception as e:  # noqa: BLE001
         _log.warning("detalhes_paj(%s): %r", url_detalhe, e)
         return {}
@@ -722,101 +884,36 @@ async def concluir_paj(id_tramites: list[str], dry_run: bool = False) -> dict:
 # ---------------------------------------------------------------------------
 # Grupos da unidade (para o dropdown de tramitação / favoritas)
 # ---------------------------------------------------------------------------
-async def listar_grupos_unidade(id_processo: str) -> list[str]:
+async def listar_grupos_unidade(id_processo: str = "") -> list[str]:
     """Lê os nomes das caixas de grupo da unidade a partir do dropdown
-    `grupoDestinatarioLocal` da tela de tramitação (precisa de um id de PAJ p/ abrir)."""
-    if not id_processo:
-        return []
+    `grupoDestinatarioLocal` da tela de tramitação. Independe de PAJ: a mesma tela
+    (`tramitaProcesso.xhtml`), acessada SEM `?id=` — pelo link "Tramitação" direto da
+    caixa de entrada (modo bloco) —, já traz o dropdown populado. `id_processo`, se
+    informado, abre a tela no contexto daquele PAJ."""
     try:
         await _ensure_logged_in()
-        page = await _get_page()
-        url = f"{SISDPU_URL}/pages/tramite/tramitaProcesso.xhtml?id={id_processo}&idTramite=0"
-        await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-        await _wait_pf_ajax(page); await page.wait_for_timeout(400)
-        if not await _resolver_conflito_login(page):
-            return []
-        grupos = await _eval_seguro(page, r"""()=>{
-            const s=document.getElementById('form_tramite:grupoDestinatarioLocal');
-            return s?[...s.options].map(o=>o.text.trim()).filter(t=>t && !/selecione/i.test(t)):[];
-        }""")
+        async with _sc.PAGE_LOCK:  # page compartilhada — ver comentário em listar_caixa_grupo
+            page = await _get_page()
+            url = f"{SISDPU_URL}/pages/tramite/tramitaProcesso.xhtml"
+            if id_processo:
+                url += f"?id={id_processo}&idTramite=0"
+            grupos = []
+            for tentativa in range(2):  # relê do zero se houve conflito — ver listar_caixa_grupo
+                await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                await _wait_pf_ajax(page); await page.wait_for_timeout(400)
+                ok_conflito, havia_conflito = await _resolver_conflito_login2(page)
+                if not ok_conflito:
+                    return []
+                grupos = await _eval_seguro(page, r"""()=>{
+                    const s=document.getElementById('form_tramite:grupoDestinatarioLocal');
+                    return s?[...s.options].map(o=>o.text.trim()).filter(t=>t && !/selecione/i.test(t)):[];
+                }""")
+                if not havia_conflito or tentativa == 1:
+                    break
+        _log.info("listar_grupos_unidade: %d grupo(s).", len(grupos or []))
         return grupos or []
     except Exception as e:  # noqa: BLE001
         _log.warning("listar_grupos_unidade falhou: %r", e)
         return []
 
 
-async def listar_fases_movimentacao(id_processo: str) -> list[str]:
-    """Lê os nomes das FASES de movimentação disponíveis (dropdown `faseId` da tela
-    de movimentação), com 'Todas as fases' marcado. Precisa de um id de PAJ p/ abrir."""
-    if not id_processo:
-        return []
-    try:
-        await _ensure_logged_in()
-        page = await _get_page()
-        url = (f"{SISDPU_URL}/pages/movimentacao/movimentaProcesso.xhtml"
-               f"?id={id_processo}&caixaEntrada=false")
-        await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-        await _wait_pf_ajax(page); await page.wait_for_timeout(400)
-        if not await _resolver_conflito_login(page):
-            return []
-        await page.evaluate(_JS_MARCAR_TODAS_FASES)
-        await _wait_pf_ajax(page); await page.wait_for_timeout(700)
-        js = ("()=>{const s=document.getElementById('%s:faseId');"
-              "return s?[...s.options].map(o=>(o.text||'').trim())"
-              ".filter(t=>t && !/selecione/i.test(t)):[];}" % _MOV_FORM)
-        fases = await _eval_seguro(page, js)
-        return fases or []
-    except Exception as e:  # noqa: BLE001
-        _log.warning("listar_fases_movimentacao falhou: %r", e)
-        return []
-
-
-# Lê a tela "Histórico de Tramitações do PAJ" e devolve as tramitações AINDA ABERTAS
-# (sem "Data / Hora de Conclusão"): o(s) grupo/usuário que está(ão) com o PAJ agora.
-_JS_CAIXAS_ABERTAS = r"""() => {
-  for (const t of document.querySelectorAll('table')) {
-    const ths = [...t.querySelectorAll('thead th, thead td')].map(x => (x.innerText||'').trim());
-    if (!ths.length) continue;
-    const iConcl = ths.findIndex(h => /conclus/i.test(h));
-    const iGrupo = ths.findIndex(h => /grupo/i.test(h));
-    const iDest  = ths.findIndex(h => /destinat/i.test(h));
-    const iRem   = ths.findIndex(h => /remetente/i.test(h));
-    const iData  = ths.findIndex(h => /tr[âa]mite/i.test(h));
-    const iDesc  = ths.findIndex(h => /descri/i.test(h));
-    if (iConcl < 0 || (iGrupo < 0 && iDest < 0)) continue;
-    const abertas = [];
-    for (const tr of t.querySelectorAll('tbody tr')) {
-      const tds = [...tr.querySelectorAll('td')];
-      if (!tds.length) continue;
-      const cell = i => (i >= 0 && tds[i] ? (tds[i].innerText||'').trim() : '');
-      if (cell(iConcl)) continue;  // já concluído -> não está aberto
-      const grupo = cell(iGrupo), dest = cell(iDest);
-      const local = grupo || dest;
-      if (!local) continue;
-      abertas.push({ local, grupo, destinatario: dest,
-                     remetente: cell(iRem), data: cell(iData), descricao: cell(iDesc) });
-    }
-    return abertas;
-  }
-  return [];
-}"""
-
-
-async def caixas_abertas_paj(id_processo: str) -> list[dict]:
-    """Onde o PAJ está ABERTO agora: linhas da tela 'Histórico de Tramitações do PAJ'
-    sem data de conclusão. Retorna [{local, grupo, destinatario, remetente, data, descricao}]."""
-    if not id_processo:
-        return []
-    try:
-        await _ensure_logged_in()
-        page = await _get_page()
-        url = f"{SISDPU_URL}/pages/tramite/historicoTramitacao.xhtml?id={id_processo}"
-        await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-        await _wait_pf_ajax(page); await page.wait_for_timeout(800)
-        if not await _resolver_conflito_login(page):
-            return []
-        res = await _eval_seguro(page, _JS_CAIXAS_ABERTAS)
-        return res if isinstance(res, list) else []
-    except Exception as e:  # noqa: BLE001
-        _log.warning("caixas_abertas_paj falhou: %r", e)
-        return []

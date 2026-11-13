@@ -27,7 +27,7 @@ PID_FILE = BASE_DIR / ".server.pid"
 LOGS_DIR = BASE_DIR / "logs"
 PORT = 8003
 
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.9.5"
 
 
 def _configurar_logging() -> None:
@@ -54,6 +54,16 @@ app.state.jinja.globals["app_version"] = APP_VERSION
 app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
 app.include_router(sat_router)
 app.include_router(cofre_router)
+
+
+@app.on_event("startup")
+async def _startup_exclusao_suave() -> None:
+    """Retoma a fila da Lixeira (exclusão suave, fora do processo do painel —
+    services/exclusao_suave.py) que possa ter ficado pendente de uma sessão
+    anterior do painel."""
+    with contextlib.suppress(Exception):
+        from services import exclusao_suave
+        exclusao_suave.iniciar()
 
 
 @app.on_event("shutdown")

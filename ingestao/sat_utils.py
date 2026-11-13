@@ -172,12 +172,15 @@ def processar_pat(pasta_temp, pasta_dest, mapa, prefixo='', nbs=None,
     descarta por antiguidade (usado em pedidos EXPLÍCITOS/complementares, orientados pelo
     usuário, que devem baixar independentemente da idade).
 
-    Retorna (mantidos, descartados, pulados_prazo, pulados_nb):
-    - mantidos:      [(arquivo_temp, nome_final)] movidos para a pasta destino;
-    - descartados:   [(arquivo_temp, motivo)] subtarefas/duplicatas removidas;
-    - pulados_prazo: [(arquivo_temp, motivo)] protocolos com mais de 5 anos (Data de
+    Retorna (mantidos, descartados, pulados_prazo, pulados_nb) — cada item é uma tupla
+    (arquivo_temp, texto_ou_nome, nb) — `nb` é o NB extraído do PRÓPRIO documento (campo
+    "nb" de `extrair_campos_procadm`), para o chamador registrar/exibir qual NB está
+    associado a cada tarefa do PAT lida e processada (pedido do usuário, 2026-11-13):
+    - mantidos:      [(arquivo_temp, nome_final, nb)] movidos para a pasta destino;
+    - descartados:   [(arquivo_temp, motivo, nb)] subtarefas/duplicatas removidas;
+    - pulados_prazo: [(arquivo_temp, motivo, nb)] protocolos com mais de 5 anos (Data de
                      entrada), NÃO baixados por regra;
-    - pulados_nb:    [(arquivo_temp, motivo)] processos de NB não indicado pelo usuário.
+    - pulados_nb:    [(arquivo_temp, motivo, nb)] processos de NB não indicado pelo usuário.
     """
     info = {}
     for f in mapa:
@@ -203,6 +206,8 @@ def processar_pat(pasta_temp, pasta_dest, mapa, prefixo='', nbs=None,
                           if str(mapa[a].get('protocolo', '')) == prot_int), arquivos[0])
         servico = mapa[principal].get('servico', '')
         campos = info[principal]
+        nb = campos.get('nb', '') or ''
+        nb_txt = nb or 'sem NB'
 
         # Regra: não baixar processo administrativo (PAT) com mais de 5 anos,
         # considerando a Data de entrada do protocolo. Descarta o grupo inteiro
@@ -212,25 +217,25 @@ def processar_pat(pasta_temp, pasta_dest, mapa, prefixo='', nbs=None,
         if aplicar_regra_5anos and _mais_de_5_anos(_der_para_data(der)):
             _apagar(arquivos)
             pulados_prazo.append((principal,
-                                  f'protocolo {prot_int} ({servico}) — pulado - protocolo há '
-                                  f'mais de 5 anos (Data de entrada {der.replace("-", "/")})'))
+                                  f'protocolo {prot_int} (NB {nb_txt}) ({servico}) — pulado - '
+                                  f'protocolo há mais de 5 anos (Data de entrada '
+                                  f'{der.replace("-", "/")})', nb))
             continue
 
         # Filtro por NB indicado pelo usuário: pula processos de NB não indicado
         # (inclusive os SEM NB, quando o filtro está ativo).
         if nbs:
-            nbd = nb_digits(campos.get('nb', ''))
+            nbd = nb_digits(nb)
             if nbd not in nbs:
                 _apagar(arquivos)
-                nb_txt = campos.get('nb', '') or 'sem NB'
                 pulados_nb.append((principal,
-                                   f'protocolo {prot_int} ({servico}) — pulado - NB {nb_txt} '
-                                   f'não indicado pelo usuário'))
+                                   f'protocolo {prot_int} (NB {nb_txt}) ({servico}) — pulado - '
+                                   f'NB não indicado pelo usuário', nb))
                 continue
 
         nome = _nome_procadm(servico, campos, prefixo)
         shutil.move(os.path.join(pasta_temp, principal), os.path.join(pasta_dest, nome))
-        mantidos.append((principal, nome))
+        mantidos.append((principal, nome, nb))
         for a in arquivos:
             if a != principal:
                 # Best-effort: se a exclusão da subtarefa/duplicata falhar (ex.: bloqueio
@@ -240,8 +245,8 @@ def processar_pat(pasta_temp, pasta_dest, mapa, prefixo='', nbs=None,
                 with contextlib.suppress(OSError):
                     os.remove(os.path.join(pasta_temp, a))
                 descartados.append((a, f'protocolo {mapa[a].get("protocolo","?")} '
-                                       f'descartado — é subtarefa/duplicata do protocolo '
-                                       f'principal {prot_int} ({servico})'))
+                                       f'(NB {nb_txt}) descartado — é subtarefa/duplicata do '
+                                       f'protocolo principal {prot_int} ({servico})', nb))
     return mantidos, descartados, pulados_prazo, pulados_nb
 
 
@@ -259,16 +264,16 @@ def _cli():
             mapa = json.load(fh)
         mant, desc, pul_prazo, pul_nb = processar_pat(pasta_temp, pasta_dest, mapa)
         print('=== MANTIDOS (principais/únicos) ===')
-        for _, nome in mant:
-            print('  [OK]', nome)
+        for _, nome, nb in mant:
+            print('  [OK]', nome, '(NB', nb or 'sem NB', ')')
         print('=== DESCARTADOS ===')
-        for a, motivo in desc:
+        for a, motivo, nb in desc:
             print('  [x]', a, '->', motivo)
         print('=== PULADOS (protocolo há mais de 5 anos) ===')
-        for a, motivo in pul_prazo:
+        for a, motivo, nb in pul_prazo:
             print('  [->]', a, '->', motivo)
         print('=== PULADOS (NB não indicado) ===')
-        for a, motivo in pul_nb:
+        for a, motivo, nb in pul_nb:
             print('  [->]', a, '->', motivo)
     else:
         print(__doc__)

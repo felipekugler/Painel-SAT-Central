@@ -25,10 +25,13 @@ Painel para baixar os documentos previdenciários de um assistido e anexa-los a 
    que cifra usuário/senha em disco — ela não é gravada em lugar nenhum e vale
    só na sessão atual (desbloqueie de novo a cada reinício do painel).
 
-5. Na tela principal: em **Adicionar PAJ**, informe o número (AAAA/UUU-NNNNN)
-   — o painel pede a senha-mestra (se ainda trancada) e busca os dados (CPF,
-   assistido, pretensão) no SISDPU. Clique em **Abrir SAT / Login** e faça o
-   login (usuário/senha/2FA) e o CAPTCHA na janela que abrir. Depois clique em
+5. Ao abrir o painel, digite a senha-mestra no modal inicial: ele conecta o
+   SISDPU e o SAT automaticamente (login/2FA/CAPTCHA são resolvidos por você
+   na janela do SAT, quando pedidos). Se a sessão do SAT cair depois, use o
+   ícone de reconectar ao lado do indicador **SAT** no topo da página.
+
+6. Na tela principal: em **Adicionar PAJ**, informe o número (AAAA/UUU-NNNNN)
+   — o painel busca os dados (CPF, assistido, pretensão) no SISDPU. Clique em
    **Baixar arquivos** e, com os documentos baixados, **Anexar ao PAJ**
    (movimenta e tramita para a caixa escolhida).
 

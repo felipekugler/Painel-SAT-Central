@@ -3,7 +3,9 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>{% block title %}Painel SAT Central{% endblock %}</title>
+    <title>{% block title %}Painel SAT{% endblock %}</title>
+    <link rel="icon" type="image/png" href="/static/img/gerid-icon.png">
+    <link rel="shortcut icon" href="/static/favicon.ico">
 
     <!-- Tailwind + DaisyUI via CDN -->
     <link href="https://cdn.jsdelivr.net/npm/daisyui@4.12.23/dist/full.min.css" rel="stylesheet" type="text/css" />
@@ -47,6 +49,38 @@
         :root[data-theme="dark"] .btn-primary:hover, :root[data-theme="dark"] .btn-primary:focus { background-color: #63cbff !important; border-color: #63cbff !important; }
         @media (prefers-color-scheme: dark) {
             :root:not([data-theme="light"]):not([data-theme="dark"]) .btn-primary { background-color: #4cc2ff !important; border-color: #4cc2ff !important; color: #003354 !important; }
+        }
+
+        /* toggle-primary: o daisyUI pinta o estado "ligado" com oklch(var(--p)), mas aqui
+           --p/--pc são HEX (overrides acima) — a cor vira inválida e a bolinha ficava
+           invisível (impossível ver se estava ligado ou desligado). Usa as cores diretas,
+           já por tema. */
+        .toggle-primary:checked {
+            background-color: #005FB8 !important;
+            border-color: #005FB8 !important;
+        }
+        :root[data-theme="dark"] .toggle-primary:checked {
+            background-color: #4cc2ff !important;
+            border-color: #4cc2ff !important;
+        }
+        @media (prefers-color-scheme: dark) {
+            :root:not([data-theme="light"]):not([data-theme="dark"]) .toggle-primary:checked {
+                background-color: #4cc2ff !important;
+                border-color: #4cc2ff !important;
+            }
+        }
+        /* checkbox-/radio-primary: mesma causa — preventivo, caso passem a ser usados. */
+        .checkbox-primary {
+            --chkbg: var(--p) !important;
+            --chkfg: var(--pc) !important;
+        }
+        .checkbox-primary:checked, .checkbox-primary[aria-checked="true"] {
+            background-color: var(--p) !important;
+            border-color: var(--p) !important;
+        }
+        .radio-primary:checked, .radio-primary[aria-checked="true"] {
+            background-color: var(--p) !important;
+            border-color: var(--p) !important;
         }
 
         .nav-item {
@@ -109,20 +143,24 @@
 <body class="bg-base-300 text-base-content min-h-screen flex flex-col">
 
     <header class="border-b border-base-300" style="background: var(--card);">
-        <div class="max-w-6xl mx-auto px-6 py-3 flex items-center gap-4 flex-wrap">
+        <div class="w-[80%] mx-auto px-6 py-3 flex items-center gap-4 flex-wrap">
             <div class="flex items-center gap-2.5">
-                <span class="inline-flex items-center justify-center w-8 h-8 rounded-lg flex-shrink-0"
-                      style="background: var(--accent); color: var(--accent-fg);">
-                    <svg xmlns="http://www.w3.org/2000/svg" class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
-                        <path stroke-linecap="round" stroke-linejoin="round" d="M9 12h3.75M9 15h3.75M9 18h3.75m3 .75H18a2.25 2.25 0 0 0 2.25-2.25V6.108c0-1.135-.845-2.098-1.976-2.192a48.424 48.424 0 0 0-1.123-.08m-5.801 0c-.065.21-.1.433-.1.66V18a2.25 2.25 0 0 0 2.25 2.25h3.75a2.25 2.25 0 0 0 2.25-2.25V2.716m-3.75 0V3c0 .414-.336.75-.75.75H6.75C6.336 3 6 3.336 6 3.75V18a2.25 2.25 0 0 0 2.25 2.25h3.75a2.25 2.25 0 0 0 2.25-2.25" />
-                    </svg>
-                </span>
-                <span class="font-bold text-base" style="color: var(--text);">Painel SAT Central</span>
+                <img src="/static/img/gerid-icon.png" alt="" class="w-8 h-8 flex-shrink-0">
+                <span class="font-bold text-base" style="color: var(--text);">PAINEL DE DOWNLOADS - SAT CENTRAL</span>
             </div>
 
             <nav class="flex items-center gap-1">
-                <a href="/" class="nav-item {% if request.url.path == '/' %}active{% endif %}">Início</a>
-                <a href="/configuracoes" class="nav-item {% if request.url.path == '/configuracoes' %}active{% endif %}">Configurações</a>
+                <a href="/" class="nav-item {% if request.url.path == '/' %}active{% endif %}" title="Início">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.8">
+                        <path stroke-linecap="round" stroke-linejoin="round" d="M2.25 12l8.954-8.955c.44-.439 1.152-.439 1.591 0L21.75 12M4.5 9.75v10.125c0 .621.504 1.125 1.125 1.125H9.75v-4.875c0-.621.504-1.125 1.125-1.125h2.25c.621 0 1.125.504 1.125 1.125V21h4.125c.621 0 1.125-.504 1.125-1.125V9.75M8.25 21h8.25" />
+                    </svg>
+                </a>
+                <a href="/configuracoes" class="nav-item {% if request.url.path == '/configuracoes' %}active{% endif %}" title="Configurações">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.8">
+                        <path stroke-linecap="round" stroke-linejoin="round" d="M9.594 3.94c.09-.542.56-.94 1.11-.94h2.593c.55 0 1.02.398 1.11.94l.213 1.281c.063.374.313.686.645.87.074.04.147.083.22.127.324.196.72.257 1.075.124l1.217-.456a1.125 1.125 0 011.37.49l1.296 2.247a1.125 1.125 0 01-.26 1.431l-1.003.827c-.293.24-.438.613-.431.992a6.759 6.759 0 010 .255c-.007.378.138.75.43.99l1.005.828c.424.35.534.954.26 1.43l-1.298 2.247a1.125 1.125 0 01-1.369.491l-1.217-.456c-.355-.133-.75-.072-1.076.124a6.47 6.47 0 01-.22.128c-.331.183-.581.495-.644.869l-.213 1.281c-.09.543-.56.94-1.11.94h-2.594c-.55 0-1.019-.398-1.11-.94l-.213-1.281c-.062-.374-.312-.686-.644-.87a6.52 6.52 0 01-.22-.127c-.325-.196-.72-.257-1.076-.124l-1.217.456a1.125 1.125 0 01-1.369-.49l-1.297-2.247a1.125 1.125 0 01.26-1.431l1.004-.827c.292-.24.437-.613.43-.992a6.932 6.932 0 010-.255c.007-.378-.138-.75-.43-.99l-1.004-.828a1.125 1.125 0 01-.26-1.43l1.297-2.247a1.125 1.125 0 011.37-.491l1.216.456c.356.133.751.072 1.076-.124.072-.044.146-.087.22-.128.332-.183.582-.495.644-.869l.214-1.28z" />
+                        <path stroke-linecap="round" stroke-linejoin="round" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+                    </svg>
+                </a>
             </nav>
 
             <div class="ml-auto flex items-center gap-3">
@@ -137,7 +175,7 @@
                 <span class="sys-selo sys-off" id="selo-sat" title="Verificando sessão do SAT…">
                     <span class="dot"></span><span class="txt">SAT</span>
                     <button type="button" class="sys-recon" onclick="reconectarSistema('sat', event)"
-                            title="Abrir a janela do SAT (login/CAPTCHA/2FA são feitos por você na janela).">
+                            title="Conectar ou Reconectar ao SAT">
                         {{ _recon_svg }}
                     </button>
                 </span>
@@ -153,7 +191,7 @@
     </header>
 
     <main class="flex-1 w-full">
-        <div class="max-w-6xl mx-auto p-6">
+        <div class="w-[80%] mx-auto p-6">
             {% block content %}{% endblock %}
         </div>
     </main>
@@ -164,12 +202,13 @@
 
     <div class="toast-container" id="toast-container"></div>
 
-    <!-- Modal de desbloqueio do cofre (sob demanda) -->
+    <!-- Modal de desbloqueio do cofre: aberto já na abertura do painel (conexão
+         automática com SISDPU e SAT) e, se cancelado, sob demanda depois. -->
     <dialog id="cofre-modal" class="modal">
         <div class="modal-box max-w-sm">
             <h3 class="font-bold text-lg mb-1">Desbloquear cofre de credenciais</h3>
             <p class="text-xs text-base-content/60 mb-3">
-                Digite a senha-mestra para liberar o acesso ao SISDPU nesta sessão. Ela vale
+                Digite a senha-mestra para conectar o painel ao SISDPU e ao SAT. Ela vale
                 só até o painel reiniciar.
             </p>
             <form onsubmit="event.preventDefault(); cofreModalConfirmar();" class="flex flex-col gap-3">
@@ -183,6 +222,23 @@
             </form>
         </div>
         <form method="dialog" class="modal-backdrop"><button onclick="cofreModalCancelar()">fechar</button></form>
+    </dialog>
+
+    <!-- Caixa de confirmação / aviso no padrão do painel (substitui confirm()/alert() do
+         navegador). Uso: `if (!(await confirmarModal({titulo, mensagem, confirmar, perigo}))) return;`
+         e `await avisoModal(mensagem, titulo)`. -->
+    <dialog id="confirma-modal" class="modal">
+        <div class="modal-box max-w-md">
+            <h3 class="font-bold text-lg mb-2" id="confirma-modal-titulo"></h3>
+            <p class="text-sm text-base-content/80 whitespace-pre-line" id="confirma-modal-msg"></p>
+            <div class="modal-action mt-4">
+                <button type="button" class="btn btn-sm btn-ghost" id="confirma-modal-cancelar"
+                        onclick="_confirmaModalFechar(false)">Cancelar</button>
+                <button type="button" class="btn btn-sm btn-primary" id="confirma-modal-ok"
+                        onclick="_confirmaModalFechar(true)">Confirmar</button>
+            </div>
+        </div>
+        <form method="dialog" class="modal-backdrop"><button onclick="_confirmaModalFechar(false)">fechar</button></form>
     </dialog>
 
     <script src="/static/js/app.js?v={{ app_version }}"></script>
@@ -240,10 +296,10 @@
         async function atualizarSeloSat() {
             try {
                 var st = await (await fetch('/api/sat/sessao-leve')).json();
-                if (st && st.logado) _setSelo('sat', 'on', 'SAT', 'Sessão ativa. Clique para trazer a janela.');
-                else _setSelo('sat', 'off', 'SAT', (st && st.msg) || 'Janela fechada / não conectado.');
+                if (st && st.logado) _setSelo('sat', 'on', 'SAT', 'Conectar ou Reconectar ao SAT');
+                else _setSelo('sat', 'off', 'SAT', 'Conectar ou Reconectar ao SAT');
             } catch (e) {
-                _setSelo('sat', 'off', 'SAT', 'Não foi possível verificar a sessão.');
+                _setSelo('sat', 'off', 'SAT', 'Conectar ou Reconectar ao SAT');
             }
         }
         window.atualizarSelos = async function () {
@@ -261,6 +317,10 @@
                     showToast(r.ok ? 'SISDPU reconectado.' : ('Falha ao reconectar: ' + (r.detalhe || '')),
                               r.ok ? 'success' : 'error');
                 } else if (sys === 'sat') {
+                    // Sem isto, com o cofre trancado o login automático (usuário/senha)
+                    // é pulado em silêncio — login/CAPTCHA/2FA caem pro modo manual sem
+                    // avisar o motivo (mesma trava que o ramo "sisdpu" já tinha).
+                    if (!(await window.garantirCofre())) return;
                     var r2 = await (await fetch('/api/sat/abrir')).json();
                     showToast(r2.logado ? 'SAT conectado.' : 'Janela do SAT aberta — faça o login.', r2.logado ? 'success' : 'info');
                 }
@@ -270,6 +330,37 @@
                 if (btn) btn.classList.remove('girando');
                 window.atualizarSelos();
             }
+        };
+
+        // ── Caixa de confirmação / aviso (padrão do painel) ────────────────
+        window._confirmaResolve = null;
+        function _abrirConfirmaModal(o, soAviso) {
+            var dlg = document.getElementById('confirma-modal');
+            document.getElementById('confirma-modal-titulo').textContent = o.titulo || (soAviso ? 'Aviso' : 'Confirmar');
+            document.getElementById('confirma-modal-msg').textContent = o.mensagem || '';
+            var ok = document.getElementById('confirma-modal-ok');
+            var cancelar = document.getElementById('confirma-modal-cancelar');
+            ok.textContent = o.confirmar || (soAviso ? 'OK' : 'Confirmar');
+            ok.className = 'btn btn-sm ' + (o.perigo ? 'btn-error' : 'btn-primary');
+            cancelar.textContent = o.cancelar || 'Cancelar';
+            cancelar.style.display = soAviso ? 'none' : '';
+            if (window._confirmaResolve) { window._confirmaResolve(false); }
+            dlg.showModal();
+            setTimeout(function () { (soAviso || !o.perigo ? ok : cancelar).focus(); }, 50);
+            return new Promise(function (resolve) { window._confirmaResolve = resolve; });
+        }
+        window._confirmaModalFechar = function (valor) {
+            var dlg = document.getElementById('confirma-modal');
+            if (dlg.open) dlg.close();
+            if (window._confirmaResolve) { var r = window._confirmaResolve; window._confirmaResolve = null; r(valor); }
+        };
+        document.getElementById('confirma-modal').addEventListener('cancel', function () {
+            window._confirmaModalFechar(false);  // tecla Esc
+        });
+        // opções: {titulo, mensagem, confirmar, cancelar, perigo} → Promise<bool>
+        window.confirmarModal = function (o) { return _abrirConfirmaModal(o || {}, false); };
+        window.avisoModal = function (mensagem, titulo) {
+            return _abrirConfirmaModal({ mensagem: mensagem, titulo: titulo }, true);
         };
 
         // ── Modal de desbloqueio do cofre (sob demanda) ────────────────────
@@ -308,8 +399,11 @@
             if (window._cofreResolve) { window._cofreResolve(false); window._cofreResolve = null; }
         };
         window.encerrarPainel = async function () {
-            if (!confirm('Encerrar o painel?\n\nIsso vai desligar o servidor. Os dados já salvos '
-                       + 'permanecem em disco.\n\nPara usar de novo, abra o Painel SAT Central pelo atalho.')) return;
+            if (!(await window.confirmarModal({
+                    titulo: 'Encerrar o painel?',
+                    mensagem: 'Isso vai desligar o servidor. Os dados já salvos permanecem em disco.\n\n'
+                            + 'Para usar de novo, abra o Painel SAT Central pelo atalho.',
+                    confirmar: 'Encerrar', perigo: true }))) return;
             var btn = document.getElementById('btn-encerrar-painel');
             if (btn) { btn.disabled = true; btn.textContent = 'Encerrando…'; }
             try { await fetch('/api/encerrar', { method: 'POST' }); } catch (e) { /* esperado */ }
@@ -326,8 +420,50 @@
                 + '</div></body></html>';
             document.open(); document.write(html); document.close();
         };
+        // ── Conexão automática na abertura do painel ───────────────────────
+        // Pede a senha-mestra logo de início (se o cofre estiver trancado) e,
+        // desbloqueado, conecta o SISDPU e abre/loga o SAT. Roda UMA vez por aba
+        // do navegador (sessionStorage): navegar entre Início e Configurações não
+        // repete o pedido nem reabre a janela do SAT. Se o usuário cancelar a
+        // senha, segue no modo sob demanda (botões de reconectar dos selos).
+        async function _conectarNaAbertura() {
+            var CHAVE = 'sat-central-autoconexao';
+            try { if (sessionStorage.getItem(CHAVE)) return; sessionStorage.setItem(CHAVE, '1'); }
+            catch (e) {}
+            var st = await _lerCofre();
+            if (!st.configurado) return;  // sem cofre: nada a conectar sozinho
+            if (!st.destrancado && !(await window.abrirModalCofre())) return;
+            await _lerCofre();
+            var tarefas = [];
+            // SISDPU — só reconecta se ainda não está conectado
+            tarefas.push((async function () {
+                try {
+                    var s1 = await (await fetch('/api/seguranca/status')).json();
+                    if (s1 && s1.conectado) return;
+                    _setSelo('sisdpu', 'off', 'SISDPU · conectando…', 'Conectando ao SISDPU…');
+                    var r = await (await fetch('/api/seguranca/reconectar', { method: 'POST' })).json();
+                    showToast(r.ok ? 'SISDPU conectado.' : ('SISDPU: falha ao conectar — ' + (r.detalhe || '')),
+                              r.ok ? 'success' : 'error');
+                } catch (e) { showToast('SISDPU: falha ao conectar — ' + e, 'error'); }
+            })());
+            // SAT — abre a janela e tenta o login automático (CAPTCHA/2FA podem pedir você)
+            tarefas.push((async function () {
+                try {
+                    var s2 = await (await fetch('/api/sat/sessao-leve')).json();
+                    if (s2 && s2.logado) return;
+                    _setSelo('sat', 'off', 'SAT · conectando…', 'Conectar ou Reconectar ao SAT');
+                    var r2 = await (await fetch('/api/sat/abrir')).json();
+                    showToast(r2.logado ? 'SAT conectado.' : 'Janela do SAT aberta — conclua o login nela.',
+                              r2.logado ? 'success' : 'info');
+                } catch (e) { showToast('SAT: falha ao abrir — ' + e, 'error'); }
+            })());
+            await Promise.all(tarefas);
+            window.atualizarSelos();
+        }
+
         window.atualizarSelos();
         setInterval(window.atualizarSelos, 15000);
+        _conectarNaAbertura();
     </script>
 </body>
 </html>

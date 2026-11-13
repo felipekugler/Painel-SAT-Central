@@ -63,6 +63,14 @@ echo    - Cadastrar as credenciais do SISDPU pelo Cofre de credenciais,
 echo      em Configuracoes ^(dentro do painel ja aberto^).
 echo    - Editar o .env somente se quiser mudar SAT_DADOS_DIR
 echo      ^(pasta onde ficam PDFs/estado — padrao: "dados" irma de "Projeto/"^).
+echo    - OPCIONAL — 2FA automatico do SAT ^(GERID^): rode
+echo      "%PY% scripts\setup_totp_sat.py" e siga as instrucoes ^(precisa da
+echo      "chave manual" do 2FA, mostrada junto do QR code no GERID^). Sem
+echo      isso, o codigo 2FA continua sendo digitado manualmente no login.
+echo    - OPCIONAL — resolucao automatica de CAPTCHA pelo CapSolver: cadastre
+echo      a chave de API no Cofre de credenciais ^(sistema "CapSolver", em
+echo      Configuracoes^) e ligue a opcao em Configuracoes. Sem isso, o
+echo      CAPTCHA continua sendo resolvido manualmente na janela do SAT.
 echo.
 echo   Para abrir o painel: de duplo clique em Painel-SAT-Central.bat
 echo ============================================================

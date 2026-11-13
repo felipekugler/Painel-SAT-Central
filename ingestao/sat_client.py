@@ -16,6 +16,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import os
+import random
 import re
 import socket
 import subprocess
@@ -35,6 +36,67 @@ SAT_CONSULTA = (
     "https://consultas.inss.gov.br/satcentral/pages/consultaCidadao/consultaCidadao.xhtml"
 )
 _CDP_PORT = 9222
+
+# --- TOTP (2FA) automático para o login GERID/CAS --------------------------
+# O login no SAT Central (GERID/Dataprev, via CAS em geridinss.dataprev.gov.br)
+# pede um código de 6 dígitos de um app autenticador — hoje resolvido manualmente
+# pelo usuário lendo a extensão Chrome "Authenticator" (linha "GERID"). Esse app
+# usa o padrão TOTP (RFC 6238), o MESMO já automatizado pro e-proc (ver
+# ingestao/eproc_client.py e o MCP C:\Claude\MCP\eproc-trf4\auth.py, no PAINEL
+# SISDPU). Aqui a seed é PRÓPRIA — conta/sistema diferente do e-proc, NUNCA
+# reaproveitar a seed de lá — guardada à parte no Credential Manager do
+# Windows via `keyring`. Cadastro: `python scripts/setup_totp_sat.py`.
+_TOTP_CRED_KEY = "sat-central"
+_TOTP_ITEM_KEY = "totp_seed"
+_BASE32_RE = re.compile(r"^[A-Z2-7]+=*$")
+
+
+def _normalizar_seed_totp(seed: str) -> str:
+    return (seed or "").replace(" ", "").replace("-", "").upper()
+
+
+def validar_seed_totp(seed: str) -> str:
+    """Valida e normaliza uma seed TOTP base32. Levanta ValueError se o formato
+    estiver errado ou o decodificador (`pyotp`) rejeitar a seed."""
+    norm = _normalizar_seed_totp(seed)
+    if not norm:
+        raise ValueError("Seed TOTP vazia.")
+    if not _BASE32_RE.match(norm):
+        raise ValueError(
+            "Seed TOTP em formato inválido. Esperado base32 (A-Z, 2-7, opcional padding '=')."
+        )
+    import pyotp
+    try:
+        pyotp.TOTP(norm).now()
+    except Exception as e:  # noqa: BLE001
+        raise ValueError(f"Seed TOTP rejeitada pelo decodificador: {e}") from e
+    return norm
+
+
+def salvar_seed_totp(seed: str) -> None:
+    """Valida e salva a seed TOTP do GERID no Credential Manager do Windows."""
+    import keyring
+    keyring.set_password(_TOTP_CRED_KEY, _TOTP_ITEM_KEY, validar_seed_totp(seed))
+
+
+def _gerar_codigo_totp() -> str | None:
+    """Código TOTP atual (6 dígitos) p/ o 2FA do GERID, lido da seed cadastrada
+    no Credential Manager. Retorna None se a seed não estiver cadastrada ou
+    `keyring`/`pyotp` faltarem — nesse caso o 2FA do login continua manual,
+    como sempre foi (nenhuma quebra do fluxo existente)."""
+    try:
+        import keyring
+        import pyotp
+    except ImportError:
+        return None
+    try:
+        seed = keyring.get_password(_TOTP_CRED_KEY, _TOTP_ITEM_KEY)
+        if not seed:
+            return None
+        return pyotp.TOTP(seed).now()
+    except Exception:  # noqa: BLE001
+        return None
+
 
 _pw = None
 _sat_pid: int | None = None  # PID do Chromium do SAT (p/ fechá-lo no shutdown do painel)
@@ -100,6 +162,16 @@ async def _ensure_chromium() -> None:
          f"--user-data-dir={_PROFILE}",
          "--no-first-run", "--no-default-browser-check",
          "--disable-features=PDFViewerUpdate,PdfUnseasoned",
+         # A extensão "Adobe Acrobat" (efaidnbmnnnibpcajpcglclefindmkaj) acaba
+         # parando em qualquer profile do Windows nesta máquina (não é política
+         # do Chrome/Chromium — checado no registro, não tem nada lá) e assume o
+         # lugar do visualizador nativo de PDF: é pesada, demora bastante pra
+         # abrir e mostra avisos/propaganda da Adobe — a demora foi confundida
+         # com bloqueio antirobô (2026-09-30). `--disable-extensions` desliga
+         # TODAS as extensões de terceiros neste Chromium (o visualizador nativo
+         # de PDF do Chrome é um componente interno, não uma extensão de
+         # usuário, e continua funcionando normalmente).
+         "--disable-extensions",
          SAT_CONSULTA],
         creationflags=flags, close_fds=True,
     )
@@ -133,8 +205,214 @@ def _status_dict(url: str) -> dict:
     }
 
 
-async def abrir() -> dict:
-    """Abre/traz à frente a janela do SAT e navega para a consulta (login se preciso)."""
+_JS_TEM_CONSULTA_PF = """()=>!!document.querySelector('[id="formFiltrosPF:txtCpf"]')"""
+
+
+async def _pagina_consulta_ok(page) -> bool:
+    """True só se a página do SAT carregou DE VERDADE a tela de consulta (existe o campo
+    de CPF) — não basta a URL "parecer" certa. Um erro do servidor (ex.: "Service
+    Unavailable") pode ficar servido NA MESMA URL esperada, sem navegar para outro
+    lugar, o que enganava a checagem antiga (só de URL) e fazia o selo aparecer verde
+    com o SAT Central fora do ar (bug corrigido em 2026-11-10)."""
+    try:
+        return bool(await page.evaluate(_JS_TEM_CONSULTA_PF))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+async def _status_dict_async(page) -> dict:
+    """Como `_status_dict`, mas com a `page` disponível confirma de verdade que a tela
+    de consulta carregou (`_pagina_consulta_ok`) antes de considerar "logado". Usar
+    sempre que houver uma `page` à mão — é a checagem que decide se o fluxo pode
+    prosseguir (fila automática, download manual), então não pode se contentar com a
+    URL sozinha."""
+    d = _status_dict(page.url)
+    if d["logado"] and not await _pagina_consulta_ok(page):
+        d["logado"] = False
+        d["motivo"] = "pagina_inesperada"
+        d["msg"] = ("O SAT Central respondeu com uma página inesperada (fora do ar ou em "
+                    "manutenção?) — tente de novo em instantes.")
+    return d
+
+
+# --- Login (usuário/senha) — campos "username"/"password" do CAS, form #fm1 -
+# Tela padrão de login do Apereo CAS (stock, sem customização), CONFIRMADO em
+# contexto descartável (sem cookies) 2026-08-14: form id="fm1", campos
+# id/name="username" (texto) e id/name="password" (senha nativa, sem máscara
+# JS por trás — value-set direto funciona, diferente do login NATIVO do
+# e-proc que exige digitação real). Botão é um <button> comum com texto
+# "Entrar" (não tem type=submit/name específico).
+_JS_TEM_LOGIN_GERID = "()=>!!document.querySelector('#username, input[name=username]')"
+
+_JS_FILL_LOGIN_GERID = r"""([usuario, senha])=>{
+  const setV=(el,v)=>{ if(!el) return false; try{el.focus();}catch(e){}
+    el.value=v;
+    el.dispatchEvent(new Event('input',{bubbles:true}));
+    el.dispatchEvent(new Event('change',{bubbles:true}));
+    el.dispatchEvent(new KeyboardEvent('keyup',{bubbles:true})); return true; };
+  const u=document.querySelector('#username, input[name=username]');
+  const p=document.querySelector('#password, input[name=password]');
+  return setV(u, usuario) && setV(p, senha);
+}"""
+
+_JS_SUBMIT_LOGIN_GERID = r"""()=>{
+  const f=document.querySelector('#fm1');
+  const b=f ? [...f.querySelectorAll('button, input[type=submit]')]
+    .find(el=>/entrar/i.test((el.innerText||el.value||'').trim())) : null;
+  if(b){ b.click(); return true; }
+  if(f){ f.submit(); return true; }
+  return false;
+}"""
+
+
+async def _preencher_login(page, usuario: str, senha: str) -> bool:
+    """Se a tela de login (usuário/senha) do CAS/GERID está presente, preenche
+    e envia. Retorna True se enviou. No-op (False) se não houver a tela ou
+    faltar usuário/senha (cofre trancado/sem credencial "sat" cadastrada) —
+    login continua manual na janela nesses casos."""
+    if not usuario or not senha:
+        return False
+    tem = False
+    with contextlib.suppress(Exception):
+        tem = await page.evaluate(_JS_TEM_LOGIN_GERID)
+    if not tem:
+        return False
+    with contextlib.suppress(Exception):
+        await page.evaluate(_JS_FILL_LOGIN_GERID, [usuario, senha])
+    await page.wait_for_timeout(300)
+    with contextlib.suppress(Exception):
+        await page.evaluate(_JS_SUBMIT_LOGIN_GERID)
+    for _ in range(30):  # ~15s aguardando sair da tela de login (foi p/ 2FA ou logou direto)
+        await page.wait_for_timeout(500)
+        with contextlib.suppress(Exception):
+            if not await page.evaluate(_JS_TEM_LOGIN_GERID):
+                break
+    await page.wait_for_timeout(500)
+    return True
+
+
+# --- 2FA (GAuth/CAS do GERID) — campo "token", CONFIRMADO AO VIVO 2026-08-14 --
+# Tela "Autenticação Google - CAS" (módulo cas-server-support-gauth, stock, sem
+# customização): form id="fm1", campo id/name="token" (texto), botão Entrar
+# name="_eventId_submit". ⚠️ A tela também tem um 2º botão perigoso,
+# name="_eventId_requestDeviceReset" ("Reiniciar Dispositivo MFA") — o submit
+# abaixo mira SÓ o "_eventId_submit", nunca esse outro.
+_JS_TEM_2FA_GERID = "()=>!!document.querySelector('#token, input[name=token]')"
+
+_JS_FILL_2FA_GERID = r"""(codigo)=>{
+  const el=document.querySelector('#token, input[name=token]');
+  if(!el) return false;
+  try{el.focus();}catch(e){}
+  el.value=codigo;
+  el.dispatchEvent(new Event('input',{bubbles:true}));
+  el.dispatchEvent(new Event('change',{bubbles:true}));
+  el.dispatchEvent(new KeyboardEvent('keyup',{bubbles:true}));
+  return true;
+}"""
+
+_JS_LER_2FA_GERID = ("()=>{const el=document.querySelector('#token, input[name=token]');"
+                      "return el ? el.value : null;}")
+
+_JS_SUBMIT_2FA_GERID = r"""()=>{
+  const b=document.querySelector('input[name=_eventId_submit], button[name=_eventId_submit]');
+  if(b){ b.click(); return true; }
+  return false;
+}"""
+
+
+async def _preencher_2fa(page) -> bool:
+    """Se a tela de 2FA do GERID (código TOTP do GAuth/CAS, campo "token") está
+    presente, gera o código a partir da seed cadastrada (ver
+    scripts/setup_totp_sat.py) e preenche/envia sozinho. Retorna True se
+    enviou. No-op (False) se não houver a tela ou a seed não estiver
+    cadastrada — nesses casos o 2FA continua manual, como sempre foi."""
+    tem = False
+    with contextlib.suppress(Exception):
+        tem = await page.evaluate(_JS_TEM_2FA_GERID)
+    if not tem:
+        return False
+    codigo = _gerar_codigo_totp()
+    if not codigo:
+        return False
+
+    ok = False
+    for _ in range(3):
+        with contextlib.suppress(Exception):
+            ok = await page.evaluate(_JS_FILL_2FA_GERID, codigo)
+        await page.wait_for_timeout(300)
+        atual = None
+        with contextlib.suppress(Exception):
+            atual = await page.evaluate(_JS_LER_2FA_GERID)
+        if ok and atual == codigo:
+            break
+        # o código pode ter virado entre tentativas (janela de 30s do TOTP) —
+        # gera de novo antes de reenviar, pra não submeter um código expirado.
+        codigo = _gerar_codigo_totp() or codigo
+    if not ok:
+        return False
+    with contextlib.suppress(Exception):
+        await page.evaluate(_JS_SUBMIT_2FA_GERID)
+    for _ in range(20):  # ~10s aguardando sair da tela de 2FA
+        await page.wait_for_timeout(500)
+        with contextlib.suppress(Exception):
+            if not await page.evaluate(_JS_TEM_2FA_GERID):
+                break
+    await page.wait_for_timeout(1000)
+    return True
+
+
+_watcher_2fa_ativo = False
+
+
+def _agendar_resolucao_2fa() -> None:
+    """Dispara em SEGUNDO PLANO (sem bloquear a resposta do endpoint que
+    chamou) um watcher com conexão CDP PRÓPRIA que fica de olho por até 3 min
+    esperando a tela de 2FA do GERID aparecer — o usuário ainda vai digitar
+    CPF/senha na janela DEPOIS que este endpoint já respondeu, então o único
+    jeito de reagir é observar em background — e resolve sozinho assim que
+    ela surgir. No-op se já tiver um watcher rodando (evita empilhar)."""
+    global _watcher_2fa_ativo
+    if _watcher_2fa_ativo:
+        return
+    import asyncio as _asyncio
+
+    async def _watch():
+        global _watcher_2fa_ativo
+        _watcher_2fa_ativo = True
+        try:
+            browser, page = await _connect()
+        except Exception:  # noqa: BLE001
+            _watcher_2fa_ativo = False
+            return
+        try:
+            ini = time.monotonic()
+            while time.monotonic() - ini < 180:  # ~3 min p/ o usuário digitar CPF/senha
+                with contextlib.suppress(Exception):
+                    if (await _status_dict_async(page))["logado"]:
+                        return
+                    if await page.evaluate(_JS_TEM_2FA_GERID):
+                        await _preencher_2fa(page)
+                        return
+                await page.wait_for_timeout(1000)
+        finally:
+            with contextlib.suppress(Exception):
+                await browser.close()
+            _watcher_2fa_ativo = False
+
+    _asyncio.create_task(_watch())
+
+
+async def abrir(usuario: str = "", senha: str = "") -> dict:
+    """Abre/traz à frente a janela do SAT e navega para a consulta, em cadeia:
+
+      1) login (usuário/senha) → se vierem do cofre (sistema "sat"), preenche
+         e envia; senão, para aqui (login manual na janela).
+      2) 2FA → resolvido sozinho se a seed TOTP estiver cadastrada (ver
+         scripts/setup_totp_sat.py); se a tela ainda não apareceu (login
+         acabou de ser enviado), arma um watcher em background que resolve
+         assim que ela surgir.
+
+    CAPTCHA (na consulta por CPF dentro do SAT) continua sempre manual."""
     browser, page = await _connect()
     try:
         with contextlib.suppress(Exception):
@@ -142,32 +420,51 @@ async def abrir() -> dict:
         with contextlib.suppress(Exception):
             await page.goto(SAT_CONSULTA, wait_until="domcontentloaded", timeout=60000)
             await page.wait_for_timeout(1500)
-        return _status_dict(page.url)
+        with contextlib.suppress(Exception):
+            await _preencher_login(page, usuario, senha)
+        with contextlib.suppress(Exception):
+            await _preencher_2fa(page)
+        d = await _status_dict_async(page)
+        if not d["logado"]:
+            _agendar_resolucao_2fa()
+        return d
     finally:
         with contextlib.suppress(Exception):
             await browser.close()
 
 
-async def status() -> dict:
-    """Verifica se a sessão está ativa navegando para a consulta (deixa a tela pronta)."""
+async def status(usuario: str = "", senha: str = "") -> dict:
+    """Verifica se a sessão está ativa navegando para a consulta (deixa a tela
+    pronta). Resolve login/2FA sozinho se as telas já estiverem na frente, ou
+    arma o watcher em background (ver `abrir`)."""
     browser, page = await _connect()
     try:
         with contextlib.suppress(Exception):
             await page.goto(SAT_CONSULTA, wait_until="domcontentloaded", timeout=60000)
             await page.wait_for_timeout(1200)
-        return _status_dict(page.url)
+        with contextlib.suppress(Exception):
+            await _preencher_login(page, usuario, senha)
+        with contextlib.suppress(Exception):
+            await _preencher_2fa(page)
+        d = await _status_dict_async(page)
+        if not d["logado"]:
+            _agendar_resolucao_2fa()
+        return d
     finally:
         with contextlib.suppress(Exception):
             await browser.close()
 
 
 async def peek() -> dict:
-    """Status LEVE p/ polling automático: só LÊ a URL das abas abertas — NÃO navega e
-    NÃO abre o Chromium (se a janela estiver fechada, retorna 'não conectado'). Assim
-    o selo atualiza sozinho sem recarregar a janela nem atrapalhar login/CAPTCHA."""
+    """Status LEVE p/ polling automático: só INSPECIONA as abas já abertas — NÃO navega
+    e NÃO abre o Chromium (se a janela estiver fechada, retorna 'não conectado'). Assim
+    o selo atualiza sozinho sem recarregar a janela nem atrapalhar login/CAPTCHA. Além da
+    URL, confirma de verdade que a tela de consulta carregou (ver `_status_dict_async`) —
+    um `evaluate` numa aba já aberta não é navegação, então não quebra essa promessa."""
     if not _porta_aberta(_CDP_PORT):
         return {"logado": False, "url": "",
-                "msg": "Janela do SAT fechada — clique em 'Abrir SAT / Login'."}
+                "msg": "Janela do SAT fechada — clique no ícone de reconectar ao lado do "
+                       "indicador \"SAT\", no topo da página."}
     try:
         pw = await _pw_start()
         browser = await pw.chromium.connect_over_cdp(f"http://127.0.0.1:{_CDP_PORT}")
@@ -176,11 +473,15 @@ async def peek() -> dict:
     try:
         ctx = browser.contexts[0] if browser.contexts else None
         pages = list(ctx.pages) if ctx else []
-        for p in pages:  # logado se ALGUMA aba está no satcentral (fora do login)
-            d = _status_dict(p.url or "")
+        melhor = None
+        for p in pages:  # logado se ALGUMA aba está no satcentral (fora do login) E de fato carregada
+            if not _status_dict(p.url or "")["logado"]:
+                continue
+            d = await _status_dict_async(p)
             if d["logado"]:
                 return d
-        return _status_dict(pages[0].url if pages else "")
+            melhor = d  # guarda o motivo mais específico (ex.: página inesperada) p/ fallback
+        return melhor or _status_dict(pages[0].url if pages else "")
     finally:
         with contextlib.suppress(Exception):
             await browser.close()
@@ -194,12 +495,94 @@ async def peek() -> dict:
 # que SEMPRE existem (flag `garantido`) o silêncio = antirobô com CERTEZA. Recuperação:
 # pausar (45s FIXO, sem progressão — decisão do usuário 2026-07-21) e re-tentar SÓ o doc.
 _MAX_TENT = 3
-_PAUSA_BLOQUEIO_MS = 45000  # 45s fixos ao detectar bloqueio antirobô (era 30s)
+_PAUSA_BLOQUEIO_MS = 45000  # 45s fixos ao detectar bloqueio antirobô
+
+# Pausa FIXA (não o ritmo configurado entre consultas) entre abrir o modal-tabela de um
+# grupo (CCON/CRER/Consignados/Laudo Social/Laudo Médico) e começar a baixar o 1º item
+# elegível da lista: um humano que acabou de abrir a lista não ficaria parado 30-45s
+# (ritmo normal) só olhando para ela antes do primeiro clique — pedido do usuário,
+# 2026-11-12. Só vale para esse instante (abrir → 1º item); entre um documento do grupo e
+# o próximo continua valendo o ritmo normal (`_ritmo`), pois ali sim há uma consulta real
+# (o "Abrir PDF") recém-concluída.
+_PAUSA_ABRIR_GRUPO_MS = 10000
+
+# "Encerrar fluxo": o usuário pode encerrar a rotina corrente (download/levantamento)
+# MANTENDO o que já foi baixado. O pedido é checado nas pausas (ritmo e espera após
+# bloqueio) — a rotina sai por _EncerrarFluxo e fecha como download parcial (o restante
+# fica para o "Baixar mais"). Vale tanto para a rotina manual quanto para a fila
+# automática da caixa (ela usa a MESMA baixar_cidadao_stream).
+_ENCERRAR: dict = {"pedido": False}
+
+
+class _EncerrarFluxo(BaseException):
+    # BaseException: atravessa os `suppress(Exception)`/`except Exception` internos.
+    pass
+
+
+def pedir_encerramento() -> bool:
+    """Pede o encerramento da rotina corrente (download/levantamento). True se havia rotina."""
+    if not _ROTINA_ATIVA:
+        return False
+    _ENCERRAR["pedido"] = True
+    return True
+
+
+def _checar_encerrar() -> None:
+    if _ENCERRAR["pedido"]:
+        raise _EncerrarFluxo()
+
+
+async def _esperar(page, ms: int) -> None:
+    """wait_for_timeout em fatias de 0,5s, atendendo um pedido de encerramento no meio."""
+    _checar_encerrar()
+    while ms > 0:
+        fatia = min(500, ms)
+        await page.wait_for_timeout(fatia)
+        ms -= fatia
+        _checar_encerrar()
+
+
+# Rotina do painel usando a janela do SAT agora (download ou levantamento) — impede que
+# uma ação manual (Baixar arquivos/Levantamento) e a fila automática da caixa disputem a
+# MESMA janela ao mesmo tempo.
+_ROTINA_ATIVA: dict = {}
+
+
+def rotina_ativa() -> dict:
+    """{tipo, nome, desde} da rotina em andamento na janela do SAT, ou {}."""
+    return dict(_ROTINA_ATIVA)
+
+
+# Consulta deixada aberta pelo LEVANTAMENTO: o "Baixar mais" logo em seguida, no mesmo
+# CPF, segue na tela do cidadão que já está na janela do SAT — sem nova consulta por CPF
+# e sem novo CAPTCHA (menos requisições ao antirrobô). Vale uma vez e por pouco tempo; se
+# a tela não estiver mais lá, consulta normal.
+_CONSULTA_ABERTA = {"cpf": "", "ate": 0.0}
+_CONSULTA_VALIDADE_S = 15 * 60
+
+
+async def _reaproveitar_consulta(page, dig: str) -> bool:
+    if _CONSULTA_ABERTA["cpf"] != dig or time.monotonic() > _CONSULTA_ABERTA["ate"]:
+        return False
+    _CONSULTA_ABERTA.update(cpf="", ate=0.0)  # uma vez só
+    try:
+        if not _status_dict(page.url)["logado"]:
+            return False
+        with contextlib.suppress(Exception):
+            await _fechar_modal(page)
+        if not await page.evaluate(_JS_TEM_CONSULTAR):
+            return False
+        corpo = re.sub(r"\D", "", await page.evaluate("()=>document.body.innerText||''"))
+        return dig in corpo
+    except Exception:  # noqa: BLE001
+        return False
+
 
 # Ritmo entre consultas: delay APÓS cada consulta (campo "Tempo entre consultas", padrão
 # 5s). É este ritmo (e não esperas fixas ad-hoc) que governa as transições entre docs/
 # grupos/modais. Só há DOIS tempos no sistema: este e a espera após bloqueio antirobô.
 _RITMO_MS = 5000
+_RITMO_MAX_MS = 5000  # máximo (== mínimo → intervalo fixo); ver `delay_max_s` em baixar_cidadao_stream
 
 # Inventário ESTRUTURADO do download corrente: 1 item por documento REVELADO no SAT.
 # item = {"key": <tipo>, "sub": <NB/protocolo/"">, "nome": <arquivo/"">, "status": ...}
@@ -209,6 +592,13 @@ _INVENTARIO: list[dict] = []
 # Seleção por SUBITEM (download complementar): set de "key|sub" (ex.: "carta_concessao|703.969.453-1",
 # "pat|1915479324"). None = sem restrição de subitem (baixa todas as linhas do tipo).
 _ALVOS = None
+
+# True quando o `_ALVOS` acima veio da RETOMADA AUTOMÁTICA da fila (subitens que falharam
+# no download anterior), e não de uma escolha explícita do usuário (botão "Baixar
+# pendentes"/"Baixar mais"). Única diferença de tratamento: mantém a regra dos 5 anos do
+# PAT em vigor (ver `aplicar_regra_5anos` em `_pat_stream`) — pedido explícito do usuário
+# dispensa essa regra só quando ELE escolheu os itens a dedo, não numa retomada automática.
+_ALVOS_DA_FILA = False
 
 # Filtro inicial por NB (Grupo 2 + PAT): set de NBs (SÓ DÍGITOS) indicado pelo usuário
 # com base na narrativa. None/vazio = sem filtro (baixa tudo). Quando ativo, no Grupo 2
@@ -239,6 +629,25 @@ _COMPILAR_LIMIAR = 3
 # NÃO é baixado (skip ANTES do clique). Setado no início de cada download principal.
 _PAT_IGNORAR: list[str] = []
 
+# Associação manual de espécies de PAT por PRETENSÃO (Configurações → Tipos de
+# documentos a baixar → "Tarefas PAT"): None = sem associação própria p/ esta pretensão
+# (baixa TODAS as não ignoradas, comportamento de sempre); lista = baixa só as espécies
+# dela (ainda respeitando _PAT_IGNORAR e o filtro por protocolo). Setado no início de
+# cada download principal (ver `services.config_service.resolver_sat_pat_filtro`).
+_PAT_FILTRO: list[str] | None = None
+
+# True quando `_ALVOS` veio de uma lista de batimento já REVISADA por um humano (pelo
+# menos um "Baixar mais"/"Salvar seleção" salvo para este PAJ — ver `revisado` em
+# services/sat_service.py). Nesse caso, um item explicitamente presente em `_ALVOS`
+# (key|sub) SOBREPÕE qualquer trava automática (lista de ignorados do PAT, associação de
+# PAT por pretensão, filtro de NB) — a seleção manual do Defensor é absoluta, igual ao
+# filtro de NB/protocolo indicado manualmente já sempre foi. Sem isto, um item reincluído
+# manualmente (ex.: reabilitar um PAT da lista de ignorados só para este PAJ) continuava
+# sendo pulado pela regra automática, mesmo com o checkbox marcado e salvo (pedido do
+# usuário, 2026-11-13). Quando `_ALVOS` vem de uma seleção NÃO revisada (1ª rodada,
+# retomada automática da fila) este sobrepor não se aplica — comportamento de sempre.
+_ALVOS_REVISADOS = False
+
 # Pasta do ACERVO (destino final dos PDFs) usada para VERIFICAÇÃO PRÉVIA: se o documento
 # já existe lá, pula o download (evita re-baixar/sobrescrever e permite RETOMAR um download
 # interrompido no meio de uma categoria). Setado no início de cada download.
@@ -255,6 +664,24 @@ def _pat_ignorado(servico: str) -> bool:
     ignorados configurada — nesse caso a tarefa NÃO é baixada."""
     s = _norm(servico)
     return bool(s) and any(_norm(t) in s for t in _PAT_IGNORAR if str(t).strip())
+
+
+def _pat_fora_do_filtro(servico: str) -> bool:
+    """True se há associação de PAT própria para esta pretensão (_PAT_FILTRO não-None)
+    e o Serviço NÃO está nela — nesse caso a tarefa não é baixada para esta pretensão."""
+    if _PAT_FILTRO is None:
+        return False
+    s = _norm(servico)
+    return not any(_norm(t) == s for t in _PAT_FILTRO)
+
+
+def _registrar_pat_descoberto(servico: str) -> None:
+    """Acrescenta a espécie ao catálogo "retro alimentável" se for nova — chamado para
+    TODA tarefa PAT revelada (baixada, ignorada ou fora do filtro da pretensão), tanto
+    no download quanto no levantamento. Nunca interrompe a rotina por falha aqui."""
+    with contextlib.suppress(Exception):
+        from services import config_service as _cfgp
+        _cfgp.registrar_sat_pat_servico(servico)
 
 
 def _ja_no_acervo(nome_arq: str) -> bool:
@@ -277,10 +704,18 @@ def _pat_ja_no_acervo(prot: str) -> bool:
     return False
 
 
-def _inv_add(key: str, sub: str, nome: str, status: str, rotulo: str = "") -> None:
+def _inv_add(key: str, sub: str, nome: str, status: str, rotulo: str = "", detalhe: str = "",
+             nb: str = "") -> None:
     # `rotulo` = rótulo humano do item (ex.: o Serviço do PAT), para exibir no "Baixar mais".
+    # `detalhe` = motivo EXATO relatado pelo SAT (banner/aviso), quando houver — exibido no
+    # modal "Situação do download" em vez do rótulo genérico do status (pedido do usuário,
+    # 2026-11-11: saber se é "falha" de verdade ou um documento que simplesmente não existe).
+    # `nb` = NB extraído do PRÓPRIO documento (só PAT, por ora) — para o usuário saber qual
+    # benefício está associado a cada tarefa do PAT lida/processada (pedido do usuário,
+    # 2026-11-13).
     _INVENTARIO.append({"key": key, "sub": (sub or ""), "nome": (nome or ""),
-                        "status": status, "rotulo": (rotulo or "")})
+                        "status": status, "rotulo": (rotulo or ""), "detalhe": (detalhe or ""),
+                        "nb": (nb or "")})
     # Persistência incremental: grava o log a cada documento (não só no fim).
     if _LOG_PERSIST is not None:
         with contextlib.suppress(Exception):
@@ -288,16 +723,18 @@ def _inv_add(key: str, sub: str, nome: str, status: str, rotulo: str = "") -> No
 
 
 async def _ritmo(page) -> None:
-    """Aplica o ritmo entre consultas: delay APÓS cada consulta (Tempo entre consultas)."""
-    if _RITMO_MS > 0:
-        await page.wait_for_timeout(_RITMO_MS)
+    """Aplica o ritmo entre consultas: delay APÓS cada consulta (Tempo entre consultas),
+    sorteado entre o mínimo (`_RITMO_MS`) e o máximo (`_RITMO_MAX_MS`) — intervalo
+    variável (menos previsível para o antirrobô) quando os dois diferem."""
+    if _RITMO_MS > 0 or _RITMO_MAX_MS > 0:
+        await _esperar(page, random.randint(_RITMO_MS, max(_RITMO_MS, _RITMO_MAX_MS)))
 
 
 # Catálogo dos tipos de documentos que a rotina sabe baixar (key estável, rótulo, grupo).
 # A seleção POR PRETENSÃO (config) filtra o download por essas keys.
-_G1 = "Grupo 1 — CNIS / Declarações (1 clique)"
-_G2 = "Grupo 2 — modais"
-_GP = "PAT"
+_G1 = "Grupo 1 — CNIS / Declarações"
+_G2 = "Grupo 2 — Famílias de documentos"
+_GP = "Processos Administrativos - Tarefas PAT"
 TIPOS_DOCUMENTOS = [
     {"key": "cnis_atividades", "label": "CNIS - Atividades", "grupo": _G1},
     {"key": "cnis_dados_cadastrais", "label": "CNIS - Dados Cadastrais", "grupo": _G1},
@@ -382,8 +819,16 @@ _JS_BANNER_NOVO = r"""()=>{
 }"""
 
 # Frases do SAT que indicam AUSÊNCIA de documento/benefício (o doc não existe) — NÃO é
-# bloqueio antirobô. Ex.: "não retornou dados", "Não foram encontrados benefícios...".
+# bloqueio antirobô. Ex.: "não retornou dados", "Não foram encontrados benefícios...",
+# "a avaliação social associada ao NB 'X' não foi encontrada" / "...está marcada como
+# avaliação social média" (Laudo Social — confirmado pelo usuário: nenhuma das duas
+# indica falha real, é apenas o NB não ter um laudo social desse tipo) — essas ausências
+# LEGÍTIMAS escapavam do antigo "nao encontrad" (por causa do "foi" no meio da frase) e
+# eram classificadas como 'indisponivel' — uma falha real — mantendo o PAJ incompleto
+# para sempre, retentando a cada rodada um documento que simplesmente não existe para
+# aquele NB; identificado 2026-11-11).
 _MARCAS_VAZIO = ("nao retorn", "nao foram encontrados", "nao encontrad",
+                 "nao foi encontrad", "esta marcada como avaliacao social",
                  "nenhum beneficio", "nenhum registro", "sem beneficio")
 
 
@@ -586,31 +1031,55 @@ async def _baixar_aba(ctx, nova, caminho: str) -> bool:
 
 
 async def _clicar_abre_aba(page, ctx, fn_click, out, reg, nome_doc="documento",
-                           alvo_norm="", garantido=False):
+                           alvo_norm="", garantido=False, espera_aba_s: float | None = None):
     """Executa fn_click() (async → bool de clicou) e aguarda um dos 3 desfechos:
     'aba' (abriu o PDF), 'sem_dados' (banner que MENCIONA o documento) ou 'bloqueio'
     (SILÊNCIO = antirobô → pausa e re-tenta). Gerador: yield-a os avisos ao vivo e
-    grava o resultado em out['nova']/out['desfecho']."""
+    grava o resultado em out['nova']/out['desfecho'].
+
+    `espera_aba_s` = quanto esperar pela aba do PDF após o clique (PAT: 30 s — processos
+    grandes, como recursos, demoram a ser montados pelo SAT). None (padrão) = usa o
+    MÍNIMO do "Tempo entre consultas" (`_RITMO_MS`, já em vigor nesta rotina) — nunca
+    menos que 8s. Motivo (pedido do usuário, 2026-11-11): o ritmo entre documentos
+    já ia esperar pelo menos esse tempo de qualquer forma antes do PRÓXIMO documento;
+    usar a mesma janela para decidir "abriu ou não" evita declarar falso bloqueio
+    antirrobô num PDF que só estava demorando mais que os 8s fixos de antes — sem
+    nenhum custo extra de tempo real, porque esse tempo já seria gasto no ritmo.
+    Aba que abrir ATRASADA (durante a pausa do antirobô ou antes do novo clique) é
+    aproveitada: conta qualquer aba surgida desde o 1º clique, sem clicar de novo nem
+    fechá-la — evita um falso alerta de antirrobô quando o PDF só estava demorando
+    mais do que o normal."""
+    if espera_aba_s is None:
+        espera_aba_s = max(8.0, _RITMO_MS / 1000)
     nova, desfecho, msg = None, "bloqueio", ""
     antes_ini = set(ctx.pages)
+
+    def _aba_nova():
+        novas = [p for p in ctx.pages if p not in antes_ini]
+        return novas[0] if novas else None
+
     for tentativa in range(1, _MAX_TENT + 1):
-        antes = set(ctx.pages)
+        nova = _aba_nova()  # aba do clique anterior que abriu atrasada?
+        if nova:
+            desfecho = "aba"
+            yield reg(f"  ✓ {nome_doc}: o PDF abriu com atraso — aproveitando", "muted")
+            break
         await page.evaluate(_JS_MARCAR_BANNERS)  # marca banners RESIDUAIS como vistos
         clicou = await fn_click()
         if clicou:
-            for _ in range(16):  # ~8s
+            for _ in range(max(1, int(espera_aba_s * 2))):  # fatias de 0,5 s
                 await page.wait_for_timeout(500)
-                novas = [p for p in ctx.pages if p not in antes]
-                if novas:  # abriu o PDF numa aba nova → prioridade sobre banner
-                    nova, desfecho = novas[0], "aba"
+                nova = _aba_nova()
+                if nova:  # abriu o PDF numa aba nova → prioridade sobre banner
+                    desfecho = "aba"
                     break
                 # QUALQUER mensagem NOVA (não residual) = motivo EXPRESSO → NÃO é antirobô.
                 # 'sem_dados' (ausência) ou 'indisponivel' (outro motivo). O antirobô só
                 # dispara no SILÊNCIO absoluto (nenhuma mensagem).
-                banner = _norm(await page.evaluate(_JS_BANNER_NOVO))
-                cls = _classificar_banner(banner)
+                banner_raw = await page.evaluate(_JS_BANNER_NOVO)
+                cls = _classificar_banner(_norm(banner_raw))
                 if cls:
-                    desfecho, msg = cls, banner
+                    desfecho, msg = cls, banner_raw.strip()
                     break
             if desfecho in ("aba", "sem_dados", "indisponivel"):
                 break
@@ -620,13 +1089,31 @@ async def _clicar_abre_aba(page, ctx, fn_click, out, reg, nome_doc="documento",
             yield reg(f"  🛡 proteção antirobô{cert} ativada em {nome_doc} — aguardando "
                       f"{_PAUSA_BLOQUEIO_MS // 1000}s e re-tentando "
                       f"({tentativa}/{_MAX_TENT - 1})", "muted")
-            await page.wait_for_timeout(_PAUSA_BLOQUEIO_MS)
-    # fecha abas órfãs (algum PDF que abriu mas não virou desfecho 'aba')
+            pausa_ms = _PAUSA_BLOQUEIO_MS
+            if tentativa >= 2:
+                # 2ª ativação seguida: dobra a pausa para tentar furar o bloqueio de vez
+                # (pedido do usuário, 2026-11-12).
+                pausa_ms *= 2
+                yield reg("  ⏳ Pausa dobrada para tentar liberar a proteção antirobô", "muted")
+            # pausa em fatias, de olho numa aba que abra atrasada (sai na hora se abrir)
+            ms = pausa_ms
+            while ms > 0 and not _aba_nova():
+                await _esperar(page, min(500, ms))
+                ms -= 500
+    # última chance: a aba do último clique abriu bem no fim da espera?
+    if desfecho == "bloqueio" and _aba_nova():
+        nova, desfecho = _aba_nova(), "aba"
+        yield reg(f"  ✓ {nome_doc}: o PDF abriu com atraso — aproveitando", "muted")
+    # fecha abas órfãs (algum PDF que abriu mas não virou desfecho 'aba') — e também uma
+    # SEGUNDA aba que tenha surgido além da escolhida como `nova` (ex.: o clique atrasado
+    # de uma tentativa anterior abrindo DEPOIS que outra já virou `nova`): nunca deixa
+    # nada aberto para trás (causa das abas de "downloads" acumuladas, 2026-11-11).
+    for p in list(ctx.pages):
+        if p not in antes_ini and p is not nova:
+            with contextlib.suppress(Exception):
+                await p.close()
     if desfecho != "aba":
-        for p in list(ctx.pages):
-            if p not in antes_ini:
-                with contextlib.suppress(Exception):
-                    await p.close()
+        nova = None
     out["nova"], out["desfecho"], out["msg"] = nova, desfecho, msg
     await _ritmo(page)  # ritmo: delay entre consultas
 
@@ -666,15 +1153,17 @@ async def _abrir_modal(page, label, out, reg, nome_doc="documento",
                 await page.wait_for_timeout(400)
                 if await page.evaluate(_JS_DIALOG_VIS):
                     out["estado"] = "modal"
-                    await _ritmo(page)  # ritmo após abrir o modal (é uma consulta)
+                    # Pausa FIXA e curta (não o ritmo normal) — o modal já está aberto,
+                    # falta só começar a baixar os itens dele (ver `_PAUSA_ABRIR_GRUPO_MS`).
+                    await _esperar(page, _PAUSA_ABRIR_GRUPO_MS)
                     return
                 # Qualquer aviso EXPRESSO NOVO (não residual) encerra a espera SEM disparar
                 # antirobô: "sem_dados" (ausência de documento/benefício) ou "indisponivel"
                 # (documento inacessível por outro motivo). Só o SILÊNCIO total é antirobô.
-                banner = _norm(await page.evaluate(_JS_BANNER_NOVO))
-                cls = _classificar_banner(banner)
+                banner_raw = await page.evaluate(_JS_BANNER_NOVO)
+                cls = _classificar_banner(_norm(banner_raw))
                 if cls:
-                    out["estado"], out["msg"] = cls, banner
+                    out["estado"], out["msg"] = cls, banner_raw.strip()
                     await _ritmo(page)
                     return
         # SILÊNCIO (nem modal nem aviso expresso) → proteção antirobô
@@ -683,7 +1172,13 @@ async def _abrir_modal(page, label, out, reg, nome_doc="documento",
             yield reg(f"  🛡 proteção antirobô{cert} ativada em {nome_doc} — aguardando "
                       f"{_PAUSA_BLOQUEIO_MS // 1000}s e re-tentando "
                       f"({tentativa}/{_MAX_TENT - 1})", "muted")
-            await page.wait_for_timeout(_PAUSA_BLOQUEIO_MS)
+            pausa_ms = _PAUSA_BLOQUEIO_MS
+            if tentativa >= 2:
+                # 2ª ativação seguida: dobra a pausa para tentar furar o bloqueio de vez
+                # (pedido do usuário, 2026-11-12).
+                pausa_ms *= 2
+                yield reg("  ⏳ Pausa dobrada para tentar liberar a proteção antirobô", "muted")
+            await _esperar(page, pausa_ms)
 
 
 # Grupo 2 = abrem em MODAL. tipo "tabela": linhas com "Abrir PDF"; "hiscre": form de datas.
@@ -771,7 +1266,12 @@ async def _baixar_modal_tabela(page, ctx, cfg, nome, pasta_destino, salvos, pula
             continue
         # Filtro inicial por NB (indicado pelo usuário na narrativa): pula linhas de NB
         # não indicado — REGISTRA no log. Vale p/ TODOS os modais-tabela (incl. Consignados).
+        # Um item presente numa lista de batimento JÁ REVISADA (ver `_ALVOS_REVISADOS`)
+        # sobrepõe este filtro — a seleção manual do Defensor é absoluta (pedido do
+        # usuário, 2026-11-13).
         nb_indicado = _NB_FILTRO is not None and sat_utils.nb_digits(nb) in _NB_FILTRO
+        if _ALVOS_REVISADOS and _ALVOS is not None and f"{cfg['key']}|{nb}" in _ALVOS:
+            nb_indicado = True
         if _NB_FILTRO is not None and not nb_indicado:
             pulados.append(f"{cfg['nome']} {nb} — pulado (NB não indicado pelo usuário)")
             _inv_add(cfg["key"], nb, "", "nao_filtrado_nb")
@@ -826,19 +1326,21 @@ async def _baixar_modal_tabela(page, ctx, cfg, nome, pasta_destino, salvos, pula
                 yield reg(f"  ✓ {nome_arq}", "ok")
             else:
                 pulados.append(f"{nome_arq} (falha no download)")
-                _inv_add(_k, nb, nome_arq, "falha")
+                _inv_add(_k, nb, nome_arq, "falha", detalhe="falha ao salvar o PDF")
                 yield reg(f"  ✗ {nome_arq}: falha no download", "erro")
         elif desf == "sem_dados":
             pulados.append(f"{base} (sem dados)")
-            _inv_add(_k, nb, "", "sem_dados")
+            _inv_add(_k, nb, "", "sem_dados", detalhe=msg)
             yield reg(f"  – {base}: não retornou dados", "muted")
         elif desf == "indisponivel":
             pulados.append(f"{base} (indisponível)")
-            _inv_add(_k, nb, "", "indisponivel")
+            _inv_add(_k, nb, "", "indisponivel", detalhe=msg)
             yield reg(f"  – {base}: {msg or 'documento indisponível'}", "muted")
         else:
             pulados.append(f"{base} (antirobô — não recuperado)")
-            _inv_add(_k, nb, "", "antirobo")
+            _inv_add(_k, nb, "", "antirobo",
+                     detalhe=f"proteção antirobô — não recuperado após {_MAX_TENT - 1} "
+                             f"esperas de {_PAUSA_BLOQUEIO_MS // 1000}s")
             yield reg(f"  ✗ {base}: proteção antirobô — não recuperado após {_MAX_TENT - 1} "
                       f"esperas de {_PAUSA_BLOQUEIO_MS // 1000}s", "erro")
 
@@ -870,19 +1372,20 @@ async def _baixar_hiscre(page, ctx, pasta_destino, salvos, pulados, reg):
             yield reg(f"  ✓ {nome_arq} (De {de} até {ate})", "ok")
         else:
             pulados.append("HISCRE (falha no download)")
-            _inv_add("hiscre", "", "", "falha")
+            _inv_add("hiscre", "", "", "falha", detalhe="falha ao salvar o PDF")
             yield reg("  ✗ HISCRE: falha no download", "erro")
     elif desf == "sem_dados":
         pulados.append("HISCRE (sem dados)")
-        _inv_add("hiscre", "", "", "sem_dados")
+        _inv_add("hiscre", "", "", "sem_dados", detalhe=msg)
         yield reg("  – HISCRE: não retornou dados", "muted")
     elif desf == "indisponivel":
         pulados.append("HISCRE (indisponível)")
-        _inv_add("hiscre", "", "", "indisponivel")
+        _inv_add("hiscre", "", "", "indisponivel", detalhe=msg)
         yield reg(f"  – HISCRE: {msg or 'documento indisponível'}", "muted")
     else:
         pulados.append("HISCRE (antirobô — não recuperado)")
-        _inv_add("hiscre", "", "", "antirobo")
+        _inv_add("hiscre", "", "", "antirobo",
+                 detalhe="proteção antirobô — não recuperado (doc sempre existe)")
         yield reg("  ✗ HISCRE: proteção antirobô — não recuperado (doc sempre existe)", "erro")
 
 
@@ -894,7 +1397,13 @@ async def _grupo2_stream(page, ctx, nome, pasta_destino, salvos, pulados, reg, s
     for cfg in _GRUPO2:
         if sel is not None and cfg["key"] not in sel:
             _inv_add(cfg["key"], "", "", "nao_selecionado")
-            yield reg(f"  · {cfg['label']}: não baixado (desativado para esta pretensão)", "muted")
+            # Motivo genérico e honesto: "não está marcado na lista de batimento desta
+            # rodada" cobre TODOS os casos reais (dispensado pela pretensão, fora do
+            # filtro de NB/protocolo, ou já baixado antes) — dizer "desativado para esta
+            # pretensão" sempre, mesmo quando a causa real era outra, confundiu o usuário
+            # (2026-11-13: documento já baixado foi relatado como "desativado pela
+            # pretensão", quando na verdade só não tinha mais nada pendente dele).
+            yield reg(f"  · {cfg['label']}: não baixado (nada pendente deste tipo nesta rodada)", "muted")
             continue
         # HISCRE é um único arquivo determinístico: se já está no acervo, pula ANTES de
         # abrir o modal (retomada). Os demais (modais-tabela) checam por linha adiante.
@@ -912,17 +1421,17 @@ async def _grupo2_stream(page, ctx, nome, pasta_destino, salvos, pulados, reg, s
         msg = out.get("msg", "")
         if estado == "sem_dados":
             pulados.append(f"{cfg['nome']} (sem dados)")
-            _inv_add(cfg["key"], "", "", "sem_dados")
+            _inv_add(cfg["key"], "", "", "sem_dados", detalhe=msg)
             yield reg(f"  – {cfg['label']}: não retornou dados", "muted")
             continue
         if estado == "indisponivel":
             pulados.append(f"{cfg['nome']} (indisponível)")
-            _inv_add(cfg["key"], "", "", "indisponivel")
+            _inv_add(cfg["key"], "", "", "indisponivel", detalhe=msg)
             yield reg(f"  – {cfg['label']}: {msg or 'documento indisponível'}", "muted")
             continue
         if estado == "bloqueio":
             pulados.append(f"{cfg['nome']} (antirobô — não recuperado)")
-            _inv_add(cfg["key"], "", "", "antirobo")
+            _inv_add(cfg["key"], "", "", "antirobo", detalhe="proteção antirobô — não recuperado")
             yield reg(f"  ✗ {cfg['label']}: proteção antirobô — não recuperado", "erro")
             continue
         if cfg["tipo"] == "hiscre":
@@ -933,6 +1442,28 @@ async def _grupo2_stream(page, ctx, nome, pasta_destino, salvos, pulados, reg, s
                     page, ctx, cfg, nome, pasta_destino, salvos, pulados, reg, pretensao):
                 yield ev
         await _fechar_modal(page)
+
+
+def _gravar_pat_resultado(mapa, mant, desc, pul_prazo, pul_nb, salvos, pulados) -> None:
+    """Registra no inventário (`_inv_add`) o resultado da deduplicação do PAT — extraído à
+    parte para poder ser chamado tanto no caminho normal (ao fim da paginação) quanto no
+    caminho de erro (conexão perdida no meio da paginação — ver `_pat_stream`), sem
+    duplicar a lógica."""
+    for _f, nm, nb in mant:
+        salvos.append(nm)
+        _inv_add("pat", mapa.get(_f, {}).get("protocolo", ""), nm, "baixado",
+                 rotulo=mapa.get(_f, {}).get("servico", ""), nb=nb)
+    for _a, _motivo, nb in desc:
+        _inv_add("pat", mapa.get(_a, {}).get("protocolo", ""), "", "descartado",
+                 rotulo=mapa.get(_a, {}).get("servico", ""), nb=nb)
+    for _p, motivo, nb in pul_prazo:
+        _inv_add("pat", mapa.get(_p, {}).get("protocolo", ""), "", "pulado_prazo",
+                 rotulo=mapa.get(_p, {}).get("servico", ""), nb=nb)
+        pulados.append(f"PAT {motivo}")
+    for _p, motivo, nb in pul_nb:
+        _inv_add("pat", mapa.get(_p, {}).get("protocolo", ""), "", "nao_filtrado_nb",
+                 rotulo=mapa.get(_p, {}).get("servico", ""), nb=nb)
+        pulados.append(f"PAT {motivo}")
 
 
 async def _pat_stream(page, ctx, nome, pasta_destino, salvos, pulados, reg):
@@ -954,103 +1485,141 @@ async def _pat_stream(page, ctx, nome, pasta_destino, salvos, pulados, reg):
     msg = out.get("msg", "")
     if estado == "sem_dados":
         pulados.append("PAT (sem dados)")
-        _inv_add("pat", "", "", "sem_dados")
+        _inv_add("pat", "", "", "sem_dados", detalhe=msg)
         yield reg("  – PAT: não retornou dados", "muted")
         return
     if estado == "indisponivel":
         pulados.append("PAT (indisponível)")
-        _inv_add("pat", "", "", "indisponivel")
+        _inv_add("pat", "", "", "indisponivel", detalhe=msg)
         yield reg(f"  – PAT: {msg or 'documento indisponível'}", "muted")
         return
     if estado != "modal":
         pulados.append("PAT (antirobô — não recuperado)")
-        _inv_add("pat", "", "", "antirobo")
+        _inv_add("pat", "", "", "antirobo",
+                 detalhe="modal não abriu — proteção antirobô (doc sempre existe)")
         yield reg("  ✗ PAT: modal não abriu — proteção antirobô (doc sempre existe)", "erro")
         return
 
     tmp = Path(pasta_destino) / "_pat_tmp"
     with contextlib.suppress(Exception):
-        import shutil as _sh
-        _sh.rmtree(tmp, ignore_errors=True)
+        from services import exclusao_suave  # Lixeira, fora do processo do painel
+        exclusao_suave.apagar_pasta(tmp, "sat:pat-tmp")
     tmp.mkdir(parents=True, exist_ok=True)
 
     mapa: dict[str, dict] = {}
     seq = 0
     pagina = 1
     vistos: set[str] = set()  # protocolos já processados (evita duplicatas na paginação)
-    while True:
-        linhas = await page.evaluate(_JS_LINHAS_MODAL)
-        for i, row in enumerate(linhas):
-            cells = _cells_dados(row)
-            prot_i = next((k for k, c in enumerate(cells) if re.fullmatch(r"\d{6,}", c)), None)
-            if prot_i is None:
-                continue  # cabeçalho / linha "nenhum registro"
-            prot = cells[prot_i]
-            # dedup: se este protocolo já foi processado (relido na paginação), pula.
-            if prot in vistos:
-                continue
-            vistos.add(prot)
-            # download por SUBITEM (complementar): só as tarefas escolhidas (ou "pat|" = todas).
-            if _ALVOS is not None and f"pat|{prot}" not in _ALVOS and "pat|" not in _ALVOS:
-                continue
-            servico = cells[prot_i + 1] if prot_i + 1 < len(cells) else ""
-            # Filtro inicial por PROTOCOLO (indicado pelo usuário): pula tarefas de
-            # protocolo não indicado — REGISTRA no log. Só se aplica ao PAT.
-            protocolo_indicado = _PROTOCOLO_FILTRO is not None and prot in _PROTOCOLO_FILTRO
-            if _PROTOCOLO_FILTRO is not None and not protocolo_indicado:
-                _inv_add("pat", prot, "", "nao_filtrado_protocolo", rotulo=servico)
-                pulados.append(f"PAT {servico} (protocolo {prot}) — pulado (protocolo não "
-                               f"indicado pelo usuário)")
-                yield reg(f"  – tarefa {prot} ({servico}): pulada — protocolo não indicado "
-                          f"pelo usuário", "muted")
-                continue
-            # Verificação prévia: PROCADM deste protocolo já no acervo → pula (retomada).
-            if _pat_ja_no_acervo(prot):
-                _inv_add("pat", prot, "", "baixado", rotulo=servico)
-                yield reg(f"  ⏭ tarefa {prot} ({servico}): já baixada — pulando", "muted")
-                continue
-            # Espécies de PAT irrelevantes (lista de ignorados): pula ANTES de baixar. Um
-            # protocolo indicado EXPLICITAMENTE pelo usuário SOBREPÕE a lista de ignorados
-            # (mesmo padrão do NB sobre o filtro por espécie no Grupo 2).
-            if not protocolo_indicado and _pat_ignorado(servico):
-                _inv_add("pat", prot, "", "ignorado", rotulo=servico)
-                pulados.append(f"PAT {servico} (protocolo {prot}) — ignorado (espécie na lista de ignorados)")
-                yield reg(f"  – tarefa {prot} ({servico}): ignorada (espécie de processo "
-                          f"administrativo na lista de ignorados)", "muted")
-                continue
-            out = {}
-            async for ev in _clicar_abre_aba(
-                    page, ctx, (lambda idx=i: page.evaluate(_JS_ABRIR_PDF_LINHA, idx)),
-                    out, reg, nome_doc=f"tarefa {prot}", garantido=True):
-                yield ev
-            nova, desf, msg = out["nova"], out["desfecho"], out.get("msg", "")
-            if desf == "aba" and nova:
-                seq += 1
-                tmpnome = f"pat_{seq:03d}.pdf"
-                ok = await _baixar_aba(ctx, nova, str(tmp / tmpnome))
-                if ok:
-                    mapa[tmpnome] = {"servico": servico, "protocolo": prot}
-                    yield reg(f"  ↓ tarefa {prot} ({servico}) baixada", "muted")
+    try:
+        while True:
+            linhas = await page.evaluate(_JS_LINHAS_MODAL)
+            for i, row in enumerate(linhas):
+                cells = _cells_dados(row)
+                prot_i = next((k for k, c in enumerate(cells) if re.fullmatch(r"\d{6,}", c)), None)
+                if prot_i is None:
+                    continue  # cabeçalho / linha "nenhum registro"
+                prot = cells[prot_i]
+                # dedup: se este protocolo já foi processado (relido na paginação), pula.
+                if prot in vistos:
+                    continue
+                vistos.add(prot)
+                # download por SUBITEM (complementar): só as tarefas escolhidas (ou "pat|" = todas).
+                if _ALVOS is not None and f"pat|{prot}" not in _ALVOS and "pat|" not in _ALVOS:
+                    continue
+                servico = cells[prot_i + 1] if prot_i + 1 < len(cells) else ""
+                _registrar_pat_descoberto(servico)  # catálogo "retro alimentável" — toda tarefa revelada conta
+                # Filtro inicial por PROTOCOLO (indicado pelo usuário): pula tarefas de
+                # protocolo não indicado — REGISTRA no log. Só se aplica ao PAT. Um item
+                # presente numa lista de batimento JÁ REVISADA (ver `_ALVOS_REVISADOS`)
+                # também conta como indicado — a seleção manual do Defensor é absoluta
+                # (pedido do usuário, 2026-11-13).
+                protocolo_indicado = _PROTOCOLO_FILTRO is not None and prot in _PROTOCOLO_FILTRO
+                if _ALVOS_REVISADOS and _ALVOS is not None and f"pat|{prot}" in _ALVOS:
+                    protocolo_indicado = True
+                if _PROTOCOLO_FILTRO is not None and not protocolo_indicado:
+                    _inv_add("pat", prot, "", "nao_filtrado_protocolo", rotulo=servico)
+                    pulados.append(f"PAT {servico} (protocolo {prot}) — pulado (protocolo não "
+                                   f"indicado pelo usuário)")
+                    yield reg(f"  – tarefa {prot} ({servico}): pulada — protocolo não indicado "
+                              f"pelo usuário", "muted")
+                    continue
+                # Verificação prévia: PROCADM deste protocolo já no acervo → pula (retomada).
+                if _pat_ja_no_acervo(prot):
+                    _inv_add("pat", prot, "", "baixado", rotulo=servico)
+                    yield reg(f"  ⏭ tarefa {prot} ({servico}): já baixada — pulando", "muted")
+                    continue
+                # Espécies de PAT irrelevantes (lista de ignorados): pula ANTES de baixar. Um
+                # protocolo indicado EXPLICITAMENTE pelo usuário SOBREPÕE a lista de ignorados
+                # (mesmo padrão do NB sobre o filtro por espécie no Grupo 2).
+                if not protocolo_indicado and _pat_ignorado(servico):
+                    _inv_add("pat", prot, "", "ignorado", rotulo=servico)
+                    pulados.append(f"PAT {servico} (protocolo {prot}) — ignorado (espécie na lista de ignorados)")
+                    yield reg(f"  – tarefa {prot} ({servico}): ignorada (espécie de processo "
+                              f"administrativo na lista de ignorados)", "muted")
+                    continue
+                # Associação por PRETENSÃO (espécies escolhidas em Configurações p/ esta
+                # pretensão): um protocolo indicado EXPLICITAMENTE pelo usuário também
+                # sobrepõe (mesmo critério do item acima).
+                if not protocolo_indicado and _pat_fora_do_filtro(servico):
+                    _inv_add("pat", prot, "", "nao_filtrado_pretensao", rotulo=servico)
+                    pulados.append(f"PAT {servico} (protocolo {prot}) — fora da associação "
+                                   f"de PAT desta pretensão")
+                    yield reg(f"  – tarefa {prot} ({servico}): fora da associação de PAT "
+                              f"configurada para esta pretensão", "muted")
+                    continue
+                out = {}
+                async for ev in _clicar_abre_aba(
+                        page, ctx, (lambda idx=i: page.evaluate(_JS_ABRIR_PDF_LINHA, idx)),
+                        out, reg, nome_doc=f"tarefa {prot}", garantido=True, espera_aba_s=30):
+                    yield ev
+                nova, desf, msg = out["nova"], out["desfecho"], out.get("msg", "")
+                if desf == "aba" and nova:
+                    seq += 1
+                    tmpnome = f"pat_{seq:03d}.pdf"
+                    ok = await _baixar_aba(ctx, nova, str(tmp / tmpnome))
+                    if ok:
+                        mapa[tmpnome] = {"servico": servico, "protocolo": prot}
+                        yield reg(f"  ↓ tarefa {prot} ({servico}) baixada", "muted")
+                    else:
+                        _inv_add("pat", prot, "", "falha", rotulo=servico, detalhe="falha ao salvar o PDF")
+                        yield reg(f"  ✗ tarefa {prot}: falha no download", "erro")
+                elif desf == "sem_dados":
+                    _inv_add("pat", prot, "", "sem_dados", rotulo=servico, detalhe=msg)
+                    yield reg(f"  – tarefa {prot}: sem dados", "muted")
+                elif desf == "indisponivel":
+                    _inv_add("pat", prot, "", "indisponivel", rotulo=servico, detalhe=msg)
+                    yield reg(f"  – tarefa {prot}: {msg or 'documento indisponível'}", "muted")
                 else:
-                    _inv_add("pat", prot, "", "falha", rotulo=servico)
-                    yield reg(f"  ✗ tarefa {prot}: falha no download", "erro")
-            elif desf == "sem_dados":
-                _inv_add("pat", prot, "", "sem_dados", rotulo=servico)
-                yield reg(f"  – tarefa {prot}: sem dados", "muted")
-            elif desf == "indisponivel":
-                _inv_add("pat", prot, "", "indisponivel", rotulo=servico)
-                yield reg(f"  – tarefa {prot}: {msg or 'documento indisponível'}", "muted")
-            else:
-                _inv_add("pat", prot, "", "antirobo", rotulo=servico)
-                yield reg(f"  ✗ tarefa {prot}: proteção antirobô — não recuperado", "erro")
-        avancou = await page.evaluate(_JS_PAG_PROX)
-        if not avancou:
-            break
-        pagina += 1
-        await _ritmo(page)  # avançar de página é uma consulta — ritmo governa a transição
-        if pagina > 50:  # trava de segurança
-            yield reg("  ⚠ PAT: >50 páginas — interrompido por segurança", "erro")
-            break
+                    _inv_add("pat", prot, "", "antirobo", rotulo=servico,
+                             detalhe="proteção antirobô — não recuperado")
+                    yield reg(f"  ✗ tarefa {prot}: proteção antirobô — não recuperado", "erro")
+            avancou = await page.evaluate(_JS_PAG_PROX)
+            if not avancou:
+                break
+            pagina += 1
+            await _ritmo(page)  # avançar de página é uma consulta — ritmo governa a transição
+            if pagina > 50:  # trava de segurança
+                yield reg("  ⚠ PAT: >50 páginas — interrompido por segurança", "erro")
+                break
+    except Exception:
+        # Conexão perdida (ou qualquer outra falha) no meio da paginação: os PDFs já
+        # baixados para a pasta temporária NÃO podem ficar de fora do inventário — sem
+        # isto, a próxima rodada baixava de novo à toa tudo que já tinha sido salvo com
+        # sucesso antes da queda (identificado 2026-11-13). Registra o que já tem em
+        # `mapa` (best-effort) e repropaga o erro original.
+        with contextlib.suppress(Exception):
+            await _fechar_modal(page)
+        if mapa:
+            with contextlib.suppress(Exception):
+                mant, desc, pul_prazo, pul_nb = sat_utils.processar_pat(
+                    str(tmp), pasta_destino, mapa, _ROTULO_ARQ,
+                    None if _ALVOS_REVISADOS else _NB_FILTRO,
+                    aplicar_regra_5anos=(_ALVOS is None or _ALVOS_DA_FILA))
+                _gravar_pat_resultado(mapa, mant, desc, pul_prazo, pul_nb, salvos, pulados)
+        with contextlib.suppress(Exception):
+            from services import exclusao_suave  # Lixeira, fora do processo do painel
+            exclusao_suave.apagar_pasta(tmp, "sat:pat-tmp")
+        raise
     await _fechar_modal(page)
 
     if not mapa:
@@ -1058,41 +1627,39 @@ async def _pat_stream(page, ctx, nome, pasta_destino, salvos, pulados, reg):
         yield reg("  – PAT: nenhuma tarefa encontrada", "muted")
     else:
         try:
-            # Em pedidos EXPLÍCITOS/complementares (o usuário escolheu os itens, _ALVOS
-            # definido), a regra dos 5 anos NÃO se aplica — baixa independentemente da idade.
+            # Em pedidos EXPLÍCITOS/complementares (o usuário escolheu os itens a dedo, _ALVOS
+            # definido e NÃO vindo da fila), a regra dos 5 anos NÃO se aplica — baixa
+            # independentemente da idade. Numa retomada AUTOMÁTICA da fila (_ALVOS_DA_FILA),
+            # a regra continua valendo normalmente — é o mesmo item que já passaria por ela
+            # na 1ª tentativa, só não deu certo por antirrobô/falha de conexão.
+            # Filtro de NB: se o item chegou até aqui (já passou pelo gate de `_ALVOS` acima)
+            # numa seleção REVISADA, ele foi explicitamente escolhido pelo Defensor — não faz
+            # sentido `processar_pat` descartá-lo de novo por NB "não indicado" (o próprio ato
+            # de selecioná-lo manualmente JÁ é a indicação). Pedido do usuário, 2026-11-13.
             mant, desc, pul_prazo, pul_nb = sat_utils.processar_pat(
-                str(tmp), pasta_destino, mapa, _ROTULO_ARQ, _NB_FILTRO,
-                aplicar_regra_5anos=(_ALVOS is None))
+                str(tmp), pasta_destino, mapa, _ROTULO_ARQ,
+                None if _ALVOS_REVISADOS else _NB_FILTRO,
+                aplicar_regra_5anos=(_ALVOS is None or _ALVOS_DA_FILA))
             yield reg(f"  PAT: {len(mapa)} tarefa(s) baixada(s) → {len(mant)} principal(is) "
                       f"mantido(s), {len(desc)} descartada(s) (subtarefa/duplicata)"
                       + (f", {len(pul_prazo)} pulado(s) (>5 anos)" if pul_prazo else "")
                       + (f", {len(pul_nb)} pulado(s) (NB não indicado)" if pul_nb else ""),
                       "novo")
-            for _f, nm in mant:
-                salvos.append(nm)
-                _inv_add("pat", mapa.get(_f, {}).get("protocolo", ""), nm, "baixado",
-                         rotulo=mapa.get(_f, {}).get("servico", ""))
+            _gravar_pat_resultado(mapa, mant, desc, pul_prazo, pul_nb, salvos, pulados)
+            for _f, nm, _nb in mant:
                 yield reg(f"  ✓ {nm}", "ok")
-            for _a, motivo in desc:
-                _inv_add("pat", mapa.get(_a, {}).get("protocolo", ""), "", "descartado",
-                         rotulo=mapa.get(_a, {}).get("servico", ""))
+            for _a, motivo, _nb in desc:
                 yield reg(f"  🗑 {motivo}", "muted")
-            for _p, motivo in pul_prazo:
-                _inv_add("pat", mapa.get(_p, {}).get("protocolo", ""), "", "pulado_prazo",
-                         rotulo=mapa.get(_p, {}).get("servico", ""))
-                pulados.append(f"PAT {motivo}")
+            for _p, motivo, _nb in pul_prazo:
                 yield reg(f"  ↷ {motivo}", "muted")
-            for _p, motivo in pul_nb:
-                _inv_add("pat", mapa.get(_p, {}).get("protocolo", ""), "", "nao_filtrado_nb",
-                         rotulo=mapa.get(_p, {}).get("servico", ""))
-                pulados.append(f"PAT {motivo}")
+            for _p, motivo, _nb in pul_nb:
                 yield reg(f"  ↷ {motivo}", "muted")
         except Exception as e:  # noqa: BLE001
             pulados.append(f"PAT (dedup falhou: {e})")
             yield reg(f"  ✗ PAT: deduplicação/nomeação falhou: {e}", "erro")
     with contextlib.suppress(Exception):
-        import shutil as _sh
-        _sh.rmtree(tmp, ignore_errors=True)
+        from services import exclusao_suave  # Lixeira, fora do processo do painel
+        exclusao_suave.apagar_pasta(tmp, "sat:pat-tmp")
 
 
 # Tipos que podem ser compilados num único PDF (nome-base → prefixo do arquivo salvo).
@@ -1136,11 +1703,169 @@ async def _compilar_por_tipo(pasta_destino, salvos, reg):
                   f"({n_pag} pág., ordem de NB decrescente) → {destino.name}", "novo")
 
 
+# --- Intervalo entre CPFs: espera sorteada entre mínimo e máximo (Configurações →
+# Arquivos SAT), entre o FIM da rotina de um CPF e a consulta do próximo (novo CAPTCHA).
+# Desconta o tempo já decorrido desde o fim da última rotina. É o que dá "ritmo lento"
+# e margem de segurança quando a fila automática da caixa processa vários PAJs seguidos
+# (cada PAJ = uma consulta por CPF).
+_ULTIMO_CPF = {"fim": 0.0, "consultou": False}
+
+
+def _intervalo_cpf_cfg() -> tuple[int, int]:
+    try:
+        from services import config_service as _cfgp
+        d = _cfgp.get_sat_central_defaults()
+        return int(d.get("intervalo_cpf", 30)), int(d.get("intervalo_cpf_max", 60))
+    except Exception:  # noqa: BLE001
+        return 30, 60
+
+
+def _fim_rotina_cpf() -> None:
+    """Chamado no `finally` das rotinas: marca o fim se houve consulta por CPF."""
+    if _ULTIMO_CPF["consultou"]:
+        _ULTIMO_CPF["fim"] = time.monotonic()
+        _ULTIMO_CPF["consultou"] = False
+
+
+async def _aguardar_intervalo_cpf(page, reg):
+    if not _ULTIMO_CPF["fim"]:
+        return
+    mn, mx = _intervalo_cpf_cfg()
+    alvo = random.randint(mn, max(mn, mx))
+    restante = alvo - (time.monotonic() - _ULTIMO_CPF["fim"])
+    if restante >= 1:
+        yield reg(f"Intervalo entre CPFs: aguardando {round(restante)} s antes de consultar o novo CPF…", "info")
+        await _esperar(page, int(restante * 1000))
+
+
+# --- CAPTCHA automático pelo CapSolver: reCAPTCHA v2 padrão no diálogo PrimeFaces
+# idFormRecaptcha:dgCaptcha; token do CapSolver no <textarea g-recaptcha-response> e
+# clique em "Enviar" (idFormRecaptcha:chkCaptcha). Qualquer falha → modo manual (o
+# Defensor resolve na janela, como sempre foi). Ver ingestao/captcha_solver.py.
+_JS_CAPTCHA_VISIVEL = r"""()=>{
+  const d = document.getElementById('idFormRecaptcha:dgCaptcha');
+  if (!d || getComputedStyle(d).display === 'none') return null;
+  const g = d.querySelector('.g-recaptcha[data-sitekey]');
+  return g ? g.dataset.sitekey : '';
+}"""
+_JS_CAPTCHA_PREENCHER = r"""(token)=>{
+  const d = document.getElementById('idFormRecaptcha:dgCaptcha') || document;
+  const ts = d.querySelectorAll('textarea[name="g-recaptcha-response"]');
+  ts.forEach(t => { t.value = token; t.innerHTML = token; });
+  return ts.length;
+}"""
+_SITEKEY_SAT = "6Leuh4keAAAAABYvivS5hMUbeUfWsvJBd072IcSn"  # fallback se o data-sitekey não for lido
+
+
+def _captcha_auto_ativo() -> bool:
+    try:
+        from services import config_service as _cfgp
+        return bool(_cfgp.get_sat_central_defaults().get("captcha_auto"))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+async def _resolver_captcha_auto(page, reg, out: dict):
+    """Tenta resolver o CAPTCHA pelo CapSolver. out["resolvido"] = True se os dados do
+    cidadão apareceram; senão o chamador cai no modo manual."""
+    from ingestao import captcha_solver
+    out["resolvido"] = False
+    if not captcha_solver.chave_api():
+        yield reg("CAPTCHA automático ligado, mas a chave do CapSolver não está disponível "
+                  "(cofre trancado ou sem cadastro) — resolva na janela.", "erro")
+        return
+    sitekey = None
+    for _ in range(40):  # até ~20 s para o diálogo do CAPTCHA (ou os dados) aparecer
+        with contextlib.suppress(Exception):
+            if await page.evaluate(_JS_TEM_CONSULTAR):
+                out["resolvido"] = True  # o SAT não pediu CAPTCHA desta vez
+                return
+            sitekey = await page.evaluate(_JS_CAPTCHA_VISIVEL)
+        if sitekey is not None:
+            break
+        await page.wait_for_timeout(500)
+    if sitekey is None:
+        yield reg("CAPTCHA automático: o diálogo do CAPTCHA não apareceu — resolva na janela.", "erro")
+        return
+    yield reg("CAPTCHA: resolvendo automaticamente pelo CapSolver…", "info")
+    res = await captcha_solver.resolver_recaptcha_v2(page.url, sitekey or _SITEKEY_SAT)
+    if not res.get("ok"):
+        yield reg(f"CAPTCHA automático falhou ({res.get('erro')}) — resolva na janela.", "erro")
+        return
+    try:
+        n = await page.evaluate(_JS_CAPTCHA_PREENCHER, res["token"])
+        if not n:
+            raise RuntimeError("campo do CAPTCHA não encontrado")
+        await page.click('[id="idFormRecaptcha:chkCaptcha"]', timeout=10000)
+        await page.wait_for_function(_JS_TEM_CONSULTAR, timeout=30000)
+    except Exception as e:  # noqa: BLE001
+        yield reg(f"CAPTCHA automático não foi aceito pelo SAT ({str(e)[:80]}) — resolva na janela.", "erro")
+        return
+    out["resolvido"] = True
+    yield reg(f"✓ CAPTCHA resolvido automaticamente ({res.get('segundos', 0)} s).", "ok")
+
+
+async def _abrir_consulta_cpf(page, cpf: str, reg, out: dict):
+    """Abre a consulta do SAT, confere a sessão e consulta o CPF. Resolve o CAPTCHA
+    sozinho pelo CapSolver se a opção estiver ligada (Configurações); senão o Defensor
+    resolve na janela, como sempre. `out["ok"]` = True quando os dados do cidadão
+    aparecem; senão já gera o evento final (done) com o motivo."""
+    out["ok"] = False
+    dig = "".join(c for c in cpf if c.isdigit())
+    if await _reaproveitar_consulta(page, dig):
+        with contextlib.suppress(Exception):
+            await page.bring_to_front()
+        yield reg("Reaproveitando a consulta do Levantamento — sem nova consulta por CPF e sem CAPTCHA.", "ok")
+        out["ok"] = True
+        return
+    async for ev in _aguardar_intervalo_cpf(page, reg):
+        yield ev
+    with contextlib.suppress(Exception):
+        await page.bring_to_front()
+        await page.goto(SAT_CONSULTA, wait_until="domcontentloaded", timeout=60000)
+        await page.wait_for_timeout(1000)
+    with contextlib.suppress(Exception):
+        await _preencher_2fa(page)  # resolve sozinho se a sessão caiu na tela de 2FA
+    _d_sessao = await _status_dict_async(page)
+    if not _d_sessao["logado"]:
+        detalhe = (_d_sessao["msg"] if _d_sessao.get("motivo") == "pagina_inesperada" else
+                   "Sessão do SAT expirada — clique no ícone de reconectar ao lado do "
+                   "indicador \"SAT\", no topo da página, e refaça o login.")
+        yield {"done": True, "resultado": {"ok": False, "sessao_expirada": True, "detalhe": detalhe}}
+        return
+    yield reg(f"Consultando o CPF {cpf}…", "novo")
+    try:
+        await page.click('[id="formFiltrosPF:txtCpf"]', timeout=10000)
+        await page.fill('[id="formFiltrosPF:txtCpf"]', "")
+        await page.type('[id="formFiltrosPF:txtCpf"]', dig, delay=25)
+        await page.click('[id="formFiltrosPF:btnConsultarPF"]', timeout=10000)
+    except Exception as e:  # noqa: BLE001
+        yield {"done": True, "resultado": {"ok": False, "detalhe": f"Falha ao iniciar a consulta: {e}"}}
+        return
+    auto: dict = {}
+    if _captcha_auto_ativo():
+        async for ev in _resolver_captcha_auto(page, reg, auto):
+            yield ev
+    if not auto.get("resolvido"):
+        yield reg("⚠ Resolva o CAPTCHA na JANELA do SAT e clique em 'Enviar'. Aguardando… (até 3 min)", "info")
+    try:
+        await page.wait_for_function(_JS_TEM_CONSULTAR, timeout=180000)
+    except Exception:
+        yield {"done": True, "resultado": {"ok": False,
+               "detalhe": "Não detectei os dados do cidadão (CAPTCHA não resolvido a tempo?)."}}
+        return
+    _ULTIMO_CPF["consultou"] = True
+    await page.wait_for_timeout(800)
+    out["ok"] = True
+
+
 async def baixar_cidadao_stream(cpf: str, nome: str, pasta_destino: str,
                                 delay_s: float = 5.0, bloqueio_s: float = 45.0,
+                                delay_max_s: float | None = None,
                                 tipos=None, pretensao="", rotulo="", alvos=None,
+                                alvos_da_fila: bool = False, alvos_revisados: bool = False,
                                 nbs=None, protocolos=None, compilar=False, compilar_limiar=3,
-                                pat_ignorar=None, pasta_acervo=None):
+                                pat_ignorar=None, pat_filtro=None, pasta_acervo=None):
     """Consulta o CPF no SAT (usuário resolve o CAPTCHA na janela) e baixa o Grupo 1
     (1 clique), o Grupo 2 (modais: CCON, CRER, HISCRE, HISCONSIGNADOS, LAUDO MEDICO) e
     o PAT (2ª Via dos Processos, com deduplicação). `delay_s` = ritmo preventivo entre
@@ -1150,14 +1875,26 @@ async def baixar_cidadao_stream(cpf: str, nome: str, pasta_destino: str,
     filtro). `protocolos` = coleção de protocolos (qualquer formato) p/ filtrar SÓ o PAT
     (None/vazio = sem filtro — baixa todas as tarefas). `compilar`/`compilar_limiar` =
     compilar por tipo quando > limiar (só no download principal). `pat_ignorar` = espécies
-    de PAT (Serviço) a NÃO baixar.
+    de PAT (Serviço) a NÃO baixar (global, qualquer pretensão). `pat_filtro` = espécies de
+    PAT associadas à PRETENSÃO atual (None = sem associação própria — baixa todas as não
+    ignoradas, igual a sempre; lista = baixa só essas, ainda respeitando `pat_ignorar` e o
+    filtro por protocolo).
     `pasta_acervo` = pasta do acervo final para VERIFICAÇÃO PRÉVIA (pula docs já presentes;
     permite RETOMAR downloads interrompidos); None = usa `pasta_destino`. O log é gravado
     INCREMENTALMENTE (a cada documento) — uma interrupção deixa o inventário parcial em disco.
+    `delay_max_s` = máximo do ritmo entre consultas (cada pausa é sorteada entre `delay_s`
+    e `delay_max_s`; ausente = intervalo fixo em `delay_s`).
+    `alvos_da_fila` = True quando `alvos` veio da retomada automática da fila (não de uma
+    escolha manual do usuário) — mantém a regra dos 5 anos do PAT em vigor (ver `_ALVOS_DA_FILA`).
+    `alvos_revisados` = True quando `alvos` veio de uma lista de batimento já revisada por
+    um humano (ver `_ALVOS_REVISADOS`) — um item explicitamente presente em `alvos`
+    sobrepõe lista de ignorados do PAT, associação de PAT por pretensão e filtro de NB.
     Gera eventos SSE; termina com {'done':True,'resultado':{...}}."""
-    global _RITMO_MS, _PAUSA_BLOQUEIO_MS, _ROTULO_ARQ, _INVENTARIO, _ALVOS
-    global _NB_FILTRO, _PROTOCOLO_FILTRO, _SOMENTE_PAT, _COMPILAR, _COMPILAR_LIMIAR, _PAT_IGNORAR, _PASTA_ACERVO, _LOG_PERSIST
+    global _RITMO_MS, _RITMO_MAX_MS, _PAUSA_BLOQUEIO_MS, _ROTULO_ARQ, _INVENTARIO, _ALVOS
+    global _NB_FILTRO, _PROTOCOLO_FILTRO, _SOMENTE_PAT, _COMPILAR, _COMPILAR_LIMIAR
+    global _PAT_IGNORAR, _PAT_FILTRO, _PASTA_ACERVO, _LOG_PERSIST, _ALVOS_DA_FILA, _ALVOS_REVISADOS
     _RITMO_MS = max(0, int(float(delay_s) * 1000))
+    _RITMO_MAX_MS = max(_RITMO_MS, int(float(delay_max_s if delay_max_s is not None else delay_s) * 1000))
     _PAUSA_BLOQUEIO_MS = max(0, int(float(bloqueio_s) * 1000))
     # filtro de NB: aceita formatado ("726.015.826-4") ou dígitos crus ("7260158264");
     # normaliza para só dígitos. Vazio/None = sem filtro.
@@ -1168,9 +1905,12 @@ async def baixar_cidadao_stream(cpf: str, nome: str, pasta_destino: str,
     _COMPILAR = bool(compilar)
     _COMPILAR_LIMIAR = max(1, int(compilar_limiar or 3))
     _PAT_IGNORAR = list(pat_ignorar) if pat_ignorar else []  # espécies de PAT a não baixar
+    _PAT_FILTRO = list(pat_filtro) if pat_filtro else None  # associação por pretensão (None = todas)
     _ROTULO_ARQ = rotulo or ""  # prefixo dos nomes (ex.: "INSTITUIDOR - ")
     _INVENTARIO = []  # zera o inventário estruturado desta rodada
     _ALVOS = set(alvos) if alvos else None  # subitens específicos (download complementar)
+    _ALVOS_DA_FILA = bool(alvos) and bool(alvos_da_fila)
+    _ALVOS_REVISADOS = bool(alvos) and bool(alvos_revisados)
     _PASTA_ACERVO = str(pasta_acervo or pasta_destino)  # verificação prévia (já baixado)
     sel = None if tipos is None else set(tipos)  # None = todos os tipos
     # "somente PAT": derivado do próprio `sel` resolvido (funciona tanto quando a rota
@@ -1182,6 +1922,7 @@ async def baixar_cidadao_stream(cpf: str, nome: str, pasta_destino: str,
     salvos: list[str] = []
     pulados: list[str] = []
     log_msgs: list[dict] = []
+    concluiu = False  # só vira True se o try chegar ao fim sozinho (ver `finally` abaixo)
     from datetime import datetime as _dt
     _ts_ini = _dt.now().isoformat(timespec="seconds")
 
@@ -1204,35 +1945,15 @@ async def baixar_cidadao_stream(cpf: str, nome: str, pasta_destino: str,
 
     browser, page = await _connect()
     ctx = page.context
+    _ROTINA_ATIVA.clear()
+    _ROTINA_ATIVA.update(tipo="download", nome=nome, desde=_ts_ini)
+    _ENCERRAR["pedido"] = False
+    out_c: dict = {}
     try:
-        with contextlib.suppress(Exception):
-            await page.bring_to_front()
-            await page.goto(SAT_CONSULTA, wait_until="domcontentloaded", timeout=60000)
-            await page.wait_for_timeout(1000)
-        if not _status_dict(page.url)["logado"]:
-            yield {"done": True, "resultado": {"ok": False,
-                   "detalhe": "Sessão do SAT expirada — clique em 'Abrir SAT / Login' e refaça o login."}}
+        async for ev in _abrir_consulta_cpf(page, cpf, reg, out_c):
+            yield ev
+        if not out_c.get("ok"):
             return
-
-        # --- consulta por CPF ---
-        dig = "".join(c for c in cpf if c.isdigit())
-        yield reg(f"Consultando o CPF {cpf}…", "novo")
-        try:
-            await page.click('[id="formFiltrosPF:txtCpf"]', timeout=10000)
-            await page.fill('[id="formFiltrosPF:txtCpf"]', "")
-            await page.type('[id="formFiltrosPF:txtCpf"]', dig, delay=25)
-            await page.click('[id="formFiltrosPF:btnConsultarPF"]', timeout=10000)
-        except Exception as e:  # noqa: BLE001
-            yield {"done": True, "resultado": {"ok": False, "detalhe": f"Falha ao iniciar a consulta: {e}"}}
-            return
-        yield reg("⚠ Resolva o CAPTCHA na JANELA do SAT e clique em 'Enviar'. Aguardando… (até 3 min)", "info")
-        try:
-            await page.wait_for_function(_JS_TEM_CONSULTAR, timeout=180000)
-        except Exception:
-            yield {"done": True, "resultado": {"ok": False,
-                   "detalhe": "Não detectei os dados do cidadão (CAPTCHA não resolvido a tempo?)."}}
-            return
-        await page.wait_for_timeout(800)
         if _SOMENTE_PAT:
             yield reg("Cidadão localizado. Opção \"Baixar exclusivamente processo "
                       "administrativo\" ativa — pulando Grupo 1 e Grupo 2, indo direto ao PAT.",
@@ -1245,7 +1966,7 @@ async def baixar_cidadao_stream(cpf: str, nome: str, pasta_destino: str,
             if sel is not None and key not in sel:
                 _inv_add(key, "", "", "nao_selecionado")
                 if not _SOMENTE_PAT:
-                    yield reg(f"  · {prefixo}: não baixado (desativado para esta pretensão)", "muted")
+                    yield reg(f"  · {prefixo}: não baixado (nada pendente deste tipo nesta rodada)", "muted")
                 continue
             # Verificação prévia: já no acervo → pula (retomada sem re-baixar).
             nome_arq_g1 = _final_nome(f"{prefixo} {nome}")
@@ -1255,25 +1976,51 @@ async def baixar_cidadao_stream(cpf: str, nome: str, pasta_destino: str,
                 continue
             alvo_norm = _norm(label)
             nova, desfecho, msg = None, "bloqueio", ""
+            # Baseline ÚNICA (não recapturada a cada tentativa) — ver nota abaixo sobre a
+            # aba atrasada.
+            antes_ini = set(ctx.pages)
+
+            def _aba_nova_g1():
+                novas = [p for p in ctx.pages if p not in antes_ini]
+                return novas[0] if novas else None
+
             # Quatro desfechos por clique: "aba" (abriu o PDF) · "sem_dados" (aviso expresso
             # de ausência) · "indisponivel" (aviso expresso de inacessibilidade) · "bloqueio"
             # (SILÊNCIO total → anti-robô → re-tentar). Qualquer aviso EXPRESSO NOVO (frescor
             # via marcação) encerra sem disparar o skip temporal do antirobô.
             for tentativa in range(1, _MAX_TENT + 1):
-                antes = set(ctx.pages)
+                # Aba de um clique ANTERIOR que só abriu atrasada (durante a pausa do
+                # antirobô)? Aproveita sem clicar de novo. ANTES disto, o baseline era
+                # recapturado (`antes = set(ctx.pages)`) no TOPO de cada tentativa — uma
+                # aba que abria atrasada ficava "invisível" na tentativa seguinte (já
+                # contava como "antiga"), nunca virava `nova` e por isso NUNCA ERA
+                # FECHADA: ficava aberta pro resto da sessão. Causa das várias abas de
+                # "downloads" acumuladas identificada 2026-11-11 (pedido do usuário).
+                nova = _aba_nova_g1()
+                if nova:
+                    desfecho = "aba"
+                    yield reg(f"  ✓ {prefixo}: o PDF abriu com atraso — aproveitando", "muted")
+                    break
                 await page.evaluate(_JS_MARCAR_BANNERS)  # marca banners RESIDUAIS como vistos
                 clicou = await page.evaluate(_JS_CLK, label)
                 if clicou:
-                    for _ in range(16):  # aguarda ~8s por aba ou aviso do documento
+                    # Janela de espera = MÍNIMO do "Tempo entre consultas" (_RITMO_MS, em
+                    # vigor nesta rotina), nunca menos que 8s — mesmo raciocínio de
+                    # `_clicar_abre_aba`: esse tempo já seria gasto no ritmo antes do
+                    # próximo documento, então usá-lo aqui não custa nada extra e evita
+                    # declarar falso bloqueio num PDF que só estava demorando mais que
+                    # os 8s fixos de antes (pedido do usuário, 2026-11-11).
+                    janela_slices = max(16, int(max(8000, _RITMO_MS) / 500))
+                    for _ in range(janela_slices):  # fatias de 0,5s
                         await page.wait_for_timeout(500)
-                        novas = [p for p in ctx.pages if p not in antes]
-                        if novas:
-                            nova, desfecho = novas[0], "aba"
+                        nova = _aba_nova_g1()
+                        if nova:
+                            desfecho = "aba"
                             break
-                        banner = _norm(await page.evaluate(_JS_BANNER_NOVO))
-                        cls = _classificar_banner(banner)
+                        banner_raw = await page.evaluate(_JS_BANNER_NOVO)
+                        cls = _classificar_banner(_norm(banner_raw))
                         if cls:
-                            desfecho, msg = cls, banner
+                            desfecho, msg = cls, banner_raw.strip()
                             break
                 if desfecho in ("aba", "sem_dados", "indisponivel"):
                     break
@@ -1284,7 +2031,27 @@ async def baixar_cidadao_stream(cpf: str, nome: str, pasta_destino: str,
                     yield reg(f"  🛡 proteção antirobô{cert} ativada em {prefixo} — aguardando "
                               f"{_PAUSA_BLOQUEIO_MS // 1000}s e re-tentando "
                       f"({tentativa}/{_MAX_TENT - 1})", "muted")
-                    await page.wait_for_timeout(_PAUSA_BLOQUEIO_MS)
+                    pausa_ms = _PAUSA_BLOQUEIO_MS
+                    if tentativa >= 2:
+                        # 2ª ativação seguida: dobra a pausa para tentar furar o bloqueio de
+                        # vez (pedido do usuário, 2026-11-12).
+                        pausa_ms *= 2
+                        yield reg("  ⏳ Pausa dobrada para tentar liberar a proteção antirobô", "muted")
+                    await _esperar(page, pausa_ms)
+            # última chance: a aba do último clique abriu bem no fim da espera (sem mais
+            # nenhuma tentativa seguinte pra pegá-la no topo do loop)?
+            if desfecho == "bloqueio":
+                nova = _aba_nova_g1()
+                if nova:
+                    desfecho = "aba"
+                    yield reg(f"  ✓ {prefixo}: o PDF abriu com atraso — aproveitando", "muted")
+            # fecha QUALQUER aba órfã que tenha surgido (ex.: um clique que abriu atrasado
+            # DEPOIS que outro já virou `nova`) — nunca deixa nada aberto para trás.
+            if desfecho != "aba":
+                for p in list(ctx.pages):
+                    if p not in antes_ini:
+                        with contextlib.suppress(Exception):
+                            await p.close()
             if desfecho == "aba" and nova:
                 with contextlib.suppress(Exception):
                     await nova.wait_for_load_state("domcontentloaded", timeout=15000)
@@ -1292,25 +2059,31 @@ async def baixar_cidadao_stream(cpf: str, nome: str, pasta_destino: str,
                 ok = await _baixar_pdf(ctx, _pdf_url(nova.url), os.path.join(pasta_destino, nome_arq))
                 with contextlib.suppress(Exception):
                     await nova.close()
+                for p in list(ctx.pages):
+                    if p not in antes_ini and p is not nova:
+                        with contextlib.suppress(Exception):
+                            await p.close()
                 if ok:
                     salvos.append(nome_arq)
                     _inv_add(key, "", nome_arq, "baixado")
                     yield reg(f"  ✓ {nome_arq}", "ok")
                 else:
                     pulados.append(f"{prefixo} (falha no download)")
-                    _inv_add(key, "", "", "falha")
+                    _inv_add(key, "", "", "falha", detalhe="falha ao salvar o PDF")
                     yield reg(f"  ✗ {prefixo}: falha no download", "erro")
             elif desfecho == "sem_dados":
                 pulados.append(f"{prefixo} (sem dados)")
-                _inv_add(key, "", "", "sem_dados")
+                _inv_add(key, "", "", "sem_dados", detalhe=msg)
                 yield reg(f"  – {prefixo}: não retornou dados", "muted")
             elif desfecho == "indisponivel":
                 pulados.append(f"{prefixo} (indisponível)")
-                _inv_add(key, "", "", "indisponivel")
+                _inv_add(key, "", "", "indisponivel", detalhe=msg)
                 yield reg(f"  – {prefixo}: {msg or 'documento indisponível'}", "muted")
             else:  # bloqueio persistente após as tentativas
                 pulados.append(f"{prefixo} (antirobô — não recuperado)")
-                _inv_add(key, "", "", "antirobo")
+                _inv_add(key, "", "", "antirobo",
+                         detalhe=f"proteção antirobô — não recuperado após {_MAX_TENT - 1} "
+                                 f"esperas de {_PAUSA_BLOQUEIO_MS // 1000}s")
                 yield reg(f"  ✗ {prefixo}: proteção antirobô — não recuperado após "
                           f"{_MAX_TENT - 1} esperas de {_PAUSA_BLOQUEIO_MS // 1000}s — "
                           f"reveja manualmente", "erro")
@@ -1332,7 +2105,7 @@ async def baixar_cidadao_stream(cpf: str, nome: str, pasta_destino: str,
                 yield ev
         else:
             _inv_add("pat", "", "", "nao_selecionado")
-            yield reg("  · Tarefas PAT: não baixado (desativado para esta pretensão)", "muted")
+            yield reg("  · Tarefas PAT: não baixado (nada pendente deste tipo nesta rodada)", "muted")
 
         # --- Compilação por tipo (CCON/CRER/Laudos) quando > limiar ---
         if _COMPILAR:
@@ -1342,18 +2115,212 @@ async def baixar_cidadao_stream(cpf: str, nome: str, pasta_destino: str,
         det = f"{len(salvos)} documento(s) baixado(s)."
         yield {"done": True, "resultado": {"ok": True, "detalhe": det,
                "salvos": salvos, "pulados": pulados, "pasta": pasta_destino}}
+        concluiu = True  # chegou ao fim sozinho — agora sim pode marcar o log como final
+    except _EncerrarFluxo:
+        yield reg("■ Fluxo encerrado pelo usuário — mantendo o que já foi baixado.", "novo")
+        yield {"done": True, "resultado": {"ok": False, "encerrado": True,
+               "detalhe": "Download encerrado pelo usuário.",
+               "salvos": salvos, "pulados": pulados, "pasta": pasta_destino}}
+        # NÃO marca `concluiu = True` aqui: o usuário pediu pra parar antes do fim, então
+        # o log continua "parcial" de propósito — é exatamente o que ele é.
     finally:
+        _ENCERRAR["pedido"] = False
+        _ROTINA_ATIVA.clear()
+        _fim_rotina_cpf()
         # Log já foi gravado INCREMENTALMENTE a cada documento; aqui grava a versão FINAL
-        # (marcando parcial=False). Se a rotina foi interrompida (perda de conexão), o
-        # parcial gravado no último _inv_add permanece em disco para permitir a retomada.
-        with contextlib.suppress(Exception):
-            import json as _json
-            Path(pasta_destino, "_log_download.json").write_text(
-                _json.dumps({"ts": _ts_ini, "cpf": cpf, "nome": nome, "salvos": salvos,
-                             "pulados": pulados, "inventario": list(_INVENTARIO),
-                             "eventos": log_msgs, "parcial": False},
-                            ensure_ascii=False, indent=2), encoding="utf-8")
+        # (marcando parcial=False) — SÓ quando o try chegou ao fim sozinho (`concluiu`).
+        # Se a rotina foi interrompida por QUALQUER motivo (perda de conexão, exceção
+        # inesperada, parada pelo usuário), o parcial gravado no último _inv_add permanece
+        # em disco, marcado como parcial de verdade — permite a retomada e não esconde que
+        # faltou terminar. Antes, bastava a consulta do CPF ter sido feita (out_c["ok"])
+        # para o log ser marcado "completo" mesmo que uma exceção tivesse interrompido o
+        # meio do caminho (ex.: conexão perdida durante o Grupo 1) — isso fez um PAJ real
+        # aparecer "pronto para anexar" com ZERO documentos baixados, sem nenhuma falha
+        # visível em lugar nenhum (identificado 2026-11-13, a partir do PAJ 04410).
+        if out_c.get("ok") and concluiu:
+            with contextlib.suppress(Exception):
+                import json as _json
+                Path(pasta_destino, "_log_download.json").write_text(
+                    _json.dumps({"ts": _ts_ini, "cpf": cpf, "nome": nome, "salvos": salvos,
+                                 "pulados": pulados, "inventario": list(_INVENTARIO),
+                                 "eventos": log_msgs, "parcial": False},
+                                ensure_ascii=False, indent=2), encoding="utf-8")
         _LOG_PERSIST = None  # desliga a persistência incremental desta rodada
         _PASTA_ACERVO = None
+        with contextlib.suppress(Exception):
+            await browser.close()
+
+
+# ---------------------------------------------------------------------------
+# LEVANTAMENTO: lista o que existe no SAT para o CPF SEM BAIXAR — linhas de cada modal
+# do Grupo 2 (benefícios por NB) e todas as tarefas do PAT. Os documentos do Grupo 1 só
+# revelam se existem ao serem abertos, então ficam "a verificar". Grava
+# `_levantamento.json` na pasta do PAJ; o "Baixar mais" passa a oferecer tudo
+# (sat_service.inventario_paj). O painel continua plenamente utilizável de forma
+# manual para um caso específico — esta rotina usa a MESMA janela/sessão do download
+# normal (e respeita "Encerrar fluxo" e o intervalo entre CPFs).
+# ---------------------------------------------------------------------------
+_LEVANTAMENTO_PULAR = {"hiscre", "consignados"}
+
+
+async def levantar_cidadao_stream(cpf: str, nome: str, pasta_destino: str,
+                                  delay_s: float = 5.0, bloqueio_s: float = 45.0,
+                                  delay_max_s: float | None = None):
+    """Lista o que existe no SAT para o CPF, SEM baixar (CAPTCHA automático pelo
+    CapSolver se ligado em Configurações; senão o Defensor resolve na janela). Grava
+    `_levantamento.json` na pasta do PAJ. Gera eventos SSE; termina com
+    {'done': True, 'resultado': {...}}."""
+    global _RITMO_MS, _RITMO_MAX_MS, _PAUSA_BLOQUEIO_MS
+    _RITMO_MS = max(0, int(float(delay_s) * 1000))
+    _RITMO_MAX_MS = max(_RITMO_MS, int(float(delay_max_s if delay_max_s is not None else delay_s) * 1000))
+    _PAUSA_BLOQUEIO_MS = max(0, int(float(bloqueio_s) * 1000))
+    Path(pasta_destino).mkdir(parents=True, exist_ok=True)
+    from datetime import datetime as _dt
+    ts_ini = _dt.now().isoformat(timespec="seconds")
+    itens: list[dict] = []
+    log_msgs: list[dict] = []
+    concluiu = False
+
+    def reg(msg: str, level: str = "info") -> dict:
+        e = _ev(msg, level)
+        log_msgs.append(e)
+        return e
+
+    def add(key: str, sub: str, status: str, rotulo: str = "", detalhe: str = "") -> None:
+        itens.append({"key": key, "sub": sub, "nome": "", "status": status, "rotulo": rotulo,
+                      "detalhe": detalhe})
+
+    _ROTINA_ATIVA.clear()
+    _ROTINA_ATIVA.update(tipo="levantamento", nome=nome, desde=ts_ini)
+    _ENCERRAR["pedido"] = False
+    browser, page = await _connect()
+    try:
+        out_c: dict = {}
+        async for ev in _abrir_consulta_cpf(page, cpf, reg, out_c):
+            yield ev
+        if not out_c.get("ok"):
+            return
+        yield reg("Cidadão localizado. Levantando o que existe no SAT (nada é baixado)…", "ok")
+
+        for _label, _prefixo, _garantido, key in _GRUPO1:
+            add(key, "", "a_verificar")
+        yield reg(f"  · Grupo 1: {len(_GRUPO1)} documento(s) — só se confirma ao abrir (ficam \"a verificar\")",
+                  "muted")
+
+        # HISCRE e Consignados NÃO são consultados no levantamento (poupa 2 consultas ao
+        # SAT); ficam "a verificar" p/ o "Baixar mais".
+        for cfg in _GRUPO2:
+            if cfg["key"] in _LEVANTAMENTO_PULAR:
+                add(cfg["key"], "", "a_verificar")
+                yield reg(f"  · {cfg['label']}: não consultado no levantamento (fica \"a verificar\")", "muted")
+                continue
+            with contextlib.suppress(Exception):
+                await _fechar_modal(page)
+            out: dict = {}
+            async for ev in _abrir_modal(page, cfg["label"], out, reg, nome_doc=cfg["label"],
+                                         alvo_norm=_norm(cfg.get("titulo") or cfg["label"]),
+                                         garantido=cfg.get("garantido", False)):
+                yield ev
+            estado = out.get("estado")
+            if estado != "modal":
+                status = {"sem_dados": "sem_dados", "indisponivel": "indisponivel"}.get(estado, "antirobo")
+                add(cfg["key"], "", status, detalhe=out.get("msg", ""))
+                yield reg(f"  – {cfg['label']}: {status.replace('_', ' ')}", "muted")
+                continue  # a pausa após a consulta já foi feita em _abrir_modal
+            if cfg["tipo"] == "hiscre":
+                add(cfg["key"], "", "disponivel")
+                yield reg("  ✓ Histórico de Créditos: disponível", "ok")
+            else:
+                n = 0
+                for row in await page.evaluate(_JS_LINHAS_MODAL):
+                    nb = _achar_nb_row(row)
+                    if not nb:
+                        continue
+                    rot = " · ".join(x for x in (_achar_especie(row), _achar_situacao(row)) if x)
+                    add(cfg["key"], nb, "disponivel", rotulo=rot)
+                    n += 1
+                if not n:
+                    add(cfg["key"], "", "sem_dados")
+                yield reg(f"  ✓ {cfg['label']}: {n} benefício(s)", "ok" if n else "muted")
+            with contextlib.suppress(Exception):
+                await _fechar_modal(page)
+            # sem _ritmo aqui: a pausa após a consulta já foi feita em _abrir_modal
+
+        # PAT — todas as páginas
+        out = {}
+        async for ev in _abrir_modal(page, "Tarefas PAT", out, reg, nome_doc="Tarefas PAT",
+                                     alvo_norm="tarefa", garantido=True):
+            yield ev
+        if out.get("estado") != "modal":
+            out = {}
+            async for ev in _abrir_modal(page, "Tarefas", out, reg, nome_doc="Tarefas PAT",
+                                         alvo_norm="tarefa", garantido=True):
+                yield ev
+        estado = out.get("estado")
+        if estado != "modal":
+            status = {"sem_dados": "sem_dados", "indisponivel": "indisponivel"}.get(estado, "antirobo")
+            add("pat", "", status, detalhe=out.get("msg", ""))
+            yield reg(f"  – Tarefas PAT: {status.replace('_', ' ')}", "muted")
+        else:
+            vistos: set[str] = set()
+            pagina = 1
+            while True:
+                for row in await page.evaluate(_JS_LINHAS_MODAL):
+                    cells = _cells_dados(row)
+                    prot_i = next((k for k, c in enumerate(cells) if re.fullmatch(r"\d{6,}", c)), None)
+                    if prot_i is None or cells[prot_i] in vistos:
+                        continue
+                    vistos.add(cells[prot_i])
+                    servico = cells[prot_i + 1] if prot_i + 1 < len(cells) else ""
+                    _registrar_pat_descoberto(servico)  # catálogo "retro alimentável"
+                    add("pat", cells[prot_i], "disponivel", rotulo=servico)
+                if not await page.evaluate(_JS_PAG_PROX):
+                    break
+                pagina += 1
+                await _ritmo(page)
+                if pagina > 50:
+                    yield reg("  ⚠ PAT: >50 páginas — levantamento interrompido por segurança", "erro")
+                    break
+            with contextlib.suppress(Exception):
+                await _fechar_modal(page)
+            if not vistos:
+                add("pat", "", "sem_dados")
+            yield reg(f"  ✓ Tarefas PAT: {len(vistos)} tarefa(s)", "ok" if vistos else "muted")
+
+        concluiu = True
+        _CONSULTA_ABERTA.update(cpf="".join(c for c in cpf if c.isdigit()),
+                                ate=time.monotonic() + _CONSULTA_VALIDADE_S)
+        n_disp = sum(1 for it in itens if it["status"] == "disponivel")
+        yield {"done": True, "resultado": {"ok": True, "detalhe":
+               f"Levantamento concluído: {n_disp} documento(s) disponível(is) no SAT, "
+               f"além dos {len(_GRUPO1)} do Grupo 1 a verificar. Escolha no \"Baixar mais\" — a consulta "
+               f"fica aberta {_CONSULTA_VALIDADE_S // 60} min (sem novo CAPTCHA).", "consulta_aberta": True}}
+    except _EncerrarFluxo:
+        yield reg("■ Levantamento encerrado pelo usuário (fica incompleto).", "novo")
+        yield {"done": True, "resultado": {"ok": False, "encerrado": True,
+               "detalhe": "Levantamento encerrado pelo usuário."}}
+    finally:
+        _ENCERRAR["pedido"] = False
+        _ROTINA_ATIVA.clear()
+        _fim_rotina_cpf()
+        with contextlib.suppress(Exception):
+            import json as _json
+            # Um levantamento COMPLETO anterior nunca é perdido: o novo só o substitui se
+            # também terminar — o anterior fica em `_levantamento.anterior.json`; um novo
+            # cancelado/interrompido vai para `_levantamento.incompleto.json` e o completo
+            # continua valendo.
+            destino = Path(pasta_destino, "_levantamento.json")
+            anterior = {}
+            with contextlib.suppress(Exception):
+                anterior = _json.loads(destino.read_text(encoding="utf-8"))
+            if not concluiu and anterior.get("completo"):
+                destino = Path(pasta_destino, "_levantamento.incompleto.json")
+            elif concluiu and anterior.get("completo"):
+                Path(pasta_destino, "_levantamento.anterior.json").write_text(
+                    _json.dumps(anterior, ensure_ascii=False, indent=2), encoding="utf-8")
+            destino.write_text(
+                _json.dumps({"ts": ts_ini, "cpf": cpf, "nome": nome, "completo": concluiu,
+                             "itens": itens, "eventos": log_msgs}, ensure_ascii=False, indent=2),
+                encoding="utf-8")
         with contextlib.suppress(Exception):
             await browser.close()

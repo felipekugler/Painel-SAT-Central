@@ -86,3 +86,27 @@ def por_id_tramite(id_tramite: str) -> dict | None:
         if str(r.get("id_tramite") or "") == str(id_tramite):
             return r
     return None
+
+
+def remover_por_paj(paj_norm: str) -> int:
+    """Remove todos os registros de histórico de um PAJ. Retorna quantos foram removidos."""
+    if not _ARQ.exists():
+        return 0
+    linhas = _ARQ.read_text(encoding="utf-8").splitlines()
+    novo: list[str] = []
+    removidos = 0
+    for linha in linhas:
+        linha = linha.strip()
+        if not linha:
+            continue
+        try:
+            r = json.loads(linha)
+        except Exception:  # noqa: BLE001
+            novo.append(linha)
+            continue
+        if str(r.get("paj_norm") or "") == str(paj_norm):
+            removidos += 1
+            continue
+        novo.append(json.dumps(r, ensure_ascii=False))
+    _ARQ.write_text(("\n".join(novo) + "\n") if novo else "", encoding="utf-8")
+    return removidos

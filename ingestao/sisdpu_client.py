@@ -9,12 +9,12 @@ sem fallback via .env.
 
 from __future__ import annotations
 
+import asyncio
 import datetime as _dt
 import logging
-import os
 import re
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from playwright.async_api import Browser, Page, async_playwright
 from playwright.async_api import TimeoutError as PWTimeoutError
@@ -22,6 +22,16 @@ import contextlib
 
 
 SISDPU_URL = "https://sisdpu.dpu.def.br/sisdpu"
+
+# Há UMA única page/sessão headless do SISDPU, compartilhada por toda a aplicação
+# (fila automática, "Sincronizar caixa" manual, "Adicionar PAJ", Configurações…).
+# Duas operações concorrentes (ex.: a fila lendo a caixa enquanto o usuário clica
+# "Sincronizar caixa" na tela) disputavam a MESMA page sem nenhuma exclusão mútua —
+# uma podia navegar a page para outra URL bem no meio da leitura da outra, lendo um
+# DOM pela metade (ex.: a tabela de uma caixa de grupo aparecendo com só 1 de 5 PAJs,
+# sem nenhum erro). PAGE_LOCK serializa as operações que leem/navegam a page
+# compartilhada — ver uso em ingestao/sisdpu_movtram.py (bug corrigido 2026-11-10).
+PAGE_LOCK = asyncio.Lock()
 
 # Logger dedicado — os logs `[busca-paj]` vao para logs/app.log (handler
 # configurado em app.py com rotacao diaria). Tambem aparecem no console
@@ -271,453 +281,6 @@ async def caixa_de_entrada() -> dict:
         "itens_tabela": table_data or [],
         "texto_pagina": body[:5000],
     }
-
-
-def parse_item_caixa(item_raw: str) -> dict | None:
-    """Extrai {paj, oficio, assistido, data, desc, etiqueta} de uma linha da caixa.
-
-    Aceita etiquetas SISDPU (rotulos livres que o Defensor aplica na caixa, tipo
-    "Aleg finais", "Urgente", etc.) presentes como prefixo antes do PAJ. O PAJ e'
-    capturado com re.search (posicional), e o texto anterior vira 'etiqueta'.
-
-    Portado de preparar_pajs.py._parse_item.
-    """
-    parts = [p.strip() for p in item_raw.split("\t")]
-    header = parts[0] if parts else ""
-    m = re.search(r"(\d{4}/\d{3}-\d+)\s*\n?\(?\s*(.*?)\s*\)?$", header, re.DOTALL)
-    if not m:
-        return None
-    paj = m.group(1).strip()
-    oficio = m.group(2).replace("E.", "").strip()
-    # Etiqueta = texto ANTES do PAJ (se houver). Strip pra limpar espacos/newlines.
-    etiqueta = header[: m.start(1)].strip()
-    assistido = parts[1] if len(parts) > 1 else ""
-    data = parts[2] if len(parts) > 2 else ""
-    descricao = parts[-1] if len(parts) >= 5 else ""
-    return {
-        "paj": paj,
-        "oficio": oficio[:120],
-        "assistido": assistido[:120],
-        "data": data,
-        "desc": descricao,
-        "etiqueta": etiqueta[:80],
-    }
-
-
-async def movimentacoes_paj(numero: str, ano: str, unidade: str = "44",
-                            esperas_curtas: bool = False) -> dict:
-    """Retorna dados completos do PAJ incluindo MOVIMENTACOES com URLs de peca.
-
-    Fluxo: Caixa de Entrada -> clica no TEXTO DO PAJ -> Detalhamento do Processo.
-
-    `esperas_curtas=True` (opt-in) reduz as esperas fixas pós-navegacao — usado pela
-    aba Retornos, que so' le movimentacoes/narrativa (nao baixa anexos). O DEFAULT
-    (`False`) preserva a temporizacao original usada pelo Sincronizador (que depende
-    dos buffers para extrair as 500 movs e abrir os popups de anexo)."""
-    _t_goto = 600 if esperas_curtas else 2000
-    _t_click = 900 if esperas_curtas else 3000
-    await _ensure_logged_in()
-    page = await _get_page()
-
-    await page.goto(
-        f"{SISDPU_URL}/pages/caixaentrada/caixaEntrada.xhtml",
-        wait_until="domcontentloaded",
-    )
-    await page.wait_for_timeout(_t_goto)
-    await _wait_pf_ajax(page, timeout=10000)
-
-    paj_texto = f"{ano}/{unidade.zfill(3)}-{numero}"
-
-    clicked = await page.evaluate(
-        """
-        (pajTexto) => {
-            const links = document.querySelectorAll('a');
-            for (const a of links) {
-                if (a.textContent.includes(pajTexto)) { a.click(); return true; }
-            }
-            return false;
-        }
-        """,
-        paj_texto,
-    )
-
-    if not clicked:
-        clicked = await page.evaluate(
-            """
-            (numero) => {
-                const links = document.querySelectorAll('a');
-                for (const a of links) {
-                    if (a.textContent.includes(numero)) { a.click(); return true; }
-                }
-                return false;
-            }
-            """,
-            numero,
-        )
-
-    if not clicked:
-        return {"erro": f"PAJ {paj_texto} não encontrado na caixa de entrada"}
-
-    await _wait_pf_ajax(page, timeout=15000)
-    await page.wait_for_timeout(_t_click)
-
-    dados = await page.evaluate(
-        """
-        () => {
-            const r = {};
-            const body = document.body.innerText;
-
-            const assistidoMatch = body.match(
-                /Assistido\\(s\\)[\\t\\s]+([^\\n]+)/
-            );
-            if (assistidoMatch) r.assistido = assistidoMatch[1].trim();
-
-            // Extrai CPF da tabela "Assistido(s) Pessoa(s) Física:"
-            // Seletor: primeira linha de dados, terceira célula (coluna CPF)
-            const cpfCell = document.querySelector(
-                '#detalhamentoForm\\\\:dataTableListaAssistidosPF tbody tr td:nth-child(3)'
-            );
-            if (cpfCell) {
-                const cpfText = cpfCell.textContent.trim().split('\\n')[0];
-                if (cpfText && /\\d{3}\\.\\d{3}\\.\\d{3}-\\d{2}/.test(cpfText)) {
-                    r.cpf_assistido = cpfText;
-                }
-            }
-
-            const pajMatch = body.match(/(\\d{4}\\/\\d{3}-\\d+)\\s*-\\s*PAJ\\s+([^\\n]+)/);
-            if (pajMatch) {
-                r.paj = pajMatch[1];
-                r.status_paj = pajMatch[2].trim();
-            }
-
-            const oficioMatch = body.match(/Oficio[\\t\\s]+([^\\n]+)/) ||
-                                body.match(/Ofício[\\t\\s]+([^\\n]+)/);
-            if (oficioMatch) r.oficio = oficioMatch[1].trim();
-
-            // Pretensao — formato "Pretensão  Area >> Subarea >> ..."
-            const pretensaoMatch = body.match(
-                /Pretens[ãa]o[\\t\\s]+([^\\n]+)/
-            );
-            if (pretensaoMatch) r.pretensao = pretensaoMatch[1].trim();
-
-            // Data de abertura
-            const aberturaMatch = body.match(
-                /(?:Data\\s+de\\s+Abertura|Dt\\.?\\s*Abertura)[\\t\\s]+([^\\n]+)/i
-            );
-            if (aberturaMatch) r.data_abertura = aberturaMatch[1].trim();
-
-            // Extração de Processo(s) Judicial(is) — TODOS os vinculados ao PAJ (a
-            // tabela "Processo Judicial" pode ter mais de uma linha de dados).
-            // IMPORTANTE: Todos os campos capturam DADOS COMPLETOS SEM LIMITE DE TAMANHO
-            const extrairProcessosJudiciais = () => {
-              const processos = [];
-
-              // Buscar tabela de "Processo Judicial"
-              const tabelas = document.querySelectorAll('table.epaj_sistema_formulario_tabela.epaj_sistema_formulario_tabela_filtro');
-              let tabelaProcesso = null;
-
-              for (const tabela of tabelas) {
-                const th = tabela.querySelector('th');
-                if (th && th.textContent.includes('Processo Judicial')) {
-                  tabelaProcesso = tabela;
-                  break;
-                }
-              }
-
-              if (!tabelaProcesso) return processos;
-
-              const linhas = tabelaProcesso.querySelectorAll('tbody tr');
-              let atual = null;  // processo em construção — recebe a próxima linha "Observações:", se houver
-
-              for (let i = 0; i < linhas.length; i++) {
-                const linha = linhas[i];
-                const celulas = linha.querySelectorAll('td');
-
-                // Linha de DADOS (3+ colunas, sem "Observações") — INICIA um novo processo
-                if (celulas.length >= 3 && !linha.textContent.includes('Observações:')) {
-                  const spanProc = celulas[0]?.querySelector('span[style*="font-weight"]');
-                  const numero = spanProc?.textContent.trim() || '';
-                  if (!numero) { atual = null; continue; }  // linha sem número — não é um processo válido
-
-                  const spanJuizo = celulas[1]?.querySelector('span[id*="juizo"]');
-                  const spanData = celulas[2]?.querySelector('span');
-                  atual = {
-                    processo_judicial: numero,
-                    juizo: spanJuizo?.textContent.trim() || null,
-                    data_inclusao: spanData?.textContent.trim() || null,
-                    observacoes_processo: null,
-                    validacao: { sucesso: false, motivo: '' },
-                  };
-                  processos.push(atual);
-                }
-
-                // Linha de OBSERVAÇÕES — pertence ao processo da linha de dados ANTERIOR
-                if (linha.textContent.includes('Observações:') && atual) {
-                  const celulasObs = linha.querySelectorAll('td');
-                  if (celulasObs.length >= 2) {
-                    atual.observacoes_processo = celulasObs[1]?.textContent.trim() || null;
-                  }
-                }
-              }
-
-              return processos;
-            };
-
-            // Tabela de movimentacoes do SISDPU (EXTRAIR ANTES da validação cruzada)
-            // ESTRUTURA DA TABELA (indices das células <td>):
-            // 0: Seq. (numero sequencial ex: "1", "2", "3")
-            // 1: Anexo (icone de clipe se houver arquivo)
-            // 2: Data/Hora (formato "DD/MM/YYYY HH:MM:SS")
-            // 3: Movimentação (tipo de movimentacao ex: "MOVIMENTAÇÃO MANUAL")
-            // 4: Fases (descricao da fase ex: "° Decurso de prazo;")
-            // 5: Descrição (texto completo da movimentacao)
-            // 6: (vazio/checkbox)
-            // 7: Usuário (nome do usuario que fez a movimentacao)
-            // 8+: (colunas adicionais)
-            // CRÍTICO: NÃO INVERTER cells[3] e cells[4] — isso quebra o painel
-            const movs = [];
-            const movRows = document.querySelectorAll('table tbody tr');
-            for (const tr of movRows) {
-                const cells = tr.querySelectorAll('td');
-                if (cells.length >= 8) {
-                    const seq = (cells[0]?.textContent || '').trim();
-                    const anexo = (cells[1]?.textContent || '').trim();
-                    const dataHora = (cells[2]?.textContent || '').trim();
-                    const movimentacao = (cells[3]?.textContent || '').trim();
-                    const fases = (cells[4]?.textContent || '').trim();
-                    const textoCompleto = cells[5]?.innerHTML || '';
-                    const usuario = (cells[7]?.textContent || '').trim();
-
-                    if (seq && /^\\d{1,4}$/.test(seq)
-                        && (textoCompleto.trim() || fases)) {
-                        const urls = textoCompleto.match(/https?:\\/\\/[^\\s]+/g) || [];
-                        const links_decisao = urls.filter(u =>
-                            u.includes('stj.jus.br') ||
-                            u.includes('stf.jus.br') ||
-                            u.includes('portal.stf') ||
-                            u.includes('processo.stj') ||
-                            u.includes('eproc') ||
-                            u.includes('downloadPeca') ||
-                            u.includes('documento') ||
-                            u.includes('decisao') ||
-                            u.endsWith('.pdf')
-                        );
-
-                        // descricao_retorno será extraído em segunda passagem (após cliques)
-                        let descricao_retorno = '';
-
-                        movs.push({
-                            seq: seq,
-                            anexo: anexo,
-                            data: dataHora,
-                            movimentacao: movimentacao,
-                            fases: fases,
-                            descricao: textoCompleto,
-                            links_decisao: links_decisao,
-                            usuario: usuario,
-                            descricao_retorno: descricao_retorno
-                        });
-                    }
-                }
-            }
-            if (movs.length > 0) r.movimentacoes = movs.slice(0, 500);
-
-            // AGORA fazer a extração de TODOS os Processos Judiciais com validação
-            // cruzada individual (após movimentações já estarem carregadas)
-            const processosJudiciais = extrairProcessosJudiciais();
-
-            // Validação cruzada contra movimentações — UMA por processo (casa pelo
-            // NÚMERO na descrição, não só a primeira "Cadastramento" encontrada —
-            // necessário quando há mais de um processo/cadastramento no PAJ).
-            for (const p of processosJudiciais) {
-              if (p.processo_judicial && p.data_inclusao) {
-                const movCadastro = movs.find(mov =>
-                  mov.movimentacao?.includes('Cadastramento de processo judicial') &&
-                  (mov.descricao || '').includes(p.processo_judicial)
-                );
-
-                if (movCadastro) {
-                  const descricao = movCadastro.descricao || '';
-                  const numeroMatch = descricao.match(/Número do Processo Judicial[:\\s]+([\\S]+)/i);
-                  const numeroNaMov = numeroMatch ? numeroMatch[1] : '';
-                  const dataMov = movCadastro.data.substring(0, 10); // DD/MM/YYYY
-
-                  if (numeroNaMov === p.processo_judicial && dataMov === p.data_inclusao) {
-                    p.validacao.sucesso = true;
-                    p.validacao.motivo = 'Validação cruzada bem-sucedida';
-                  } else {
-                    p.validacao.motivo = 'Dados não coincidem com movimentação';
-                  }
-                } else {
-                  p.validacao.motivo = 'Movimentação de cadastramento não encontrada';
-                }
-              } else {
-                p.validacao.motivo = 'Dados incompletos (sem número ou data)';
-              }
-            }
-
-            // Armazenar dados extraídos — campos SINGULARES preservados (compat com
-            // consumidores existentes: ÚLTIMO processo da tabela, mesmo comportamento
-            // de antes) + a LISTA COMPLETA e fiel de todos os processos vinculados.
-            const ultimoProcesso = processosJudiciais.length
-                ? processosJudiciais[processosJudiciais.length - 1] : null;
-            r.processo_judicial = ultimoProcesso ? ultimoProcesso.processo_judicial : null;
-            r.juizo = ultimoProcesso ? ultimoProcesso.juizo : null;
-            r.data_inclusao = ultimoProcesso ? ultimoProcesso.data_inclusao : null;
-            r.observacoes_processo = ultimoProcesso ? ultimoProcesso.observacoes_processo : null;
-            r.validacao_processo = ultimoProcesso ? ultimoProcesso.validacao : { sucesso: false, motivo: '' };
-            r.processos_judiciais = processosJudiciais;
-
-            // Extração da Narrativa
-            const extrairNarrativa = () => {
-              let narrativa = null;
-
-              // Buscar tabelas na página
-              const tabelas = document.querySelectorAll('table.epaj_sistema_formulario_tabela');
-
-              for (const tabela of tabelas) {
-                // Buscar header com "Narrativa"
-                const headers = tabela.querySelectorAll('th.epaj_sistema_formulario_tabela_th_titulo');
-                let temNarrativa = false;
-
-                for (const th of headers) {
-                  if (th.textContent.includes('Narrativa')) {
-                    temNarrativa = true;
-                    break;
-                  }
-                }
-
-                if (temNarrativa) {
-                  // Encontrou a tabela de Narrativa
-                  // Procurar o conteúdo após "Editar Narrativa"
-                  const linhas = tabela.querySelectorAll('tbody tr');
-
-                  for (let i = 0; i < linhas.length; i++) {
-                    const linha = linhas[i];
-                    const textoLinha = linha.textContent;
-
-                    // Procurar por "Editar Narrativa"
-                    if (textoLinha.includes('Editar Narrativa')) {
-                      // A narrativa está na próxima linha ou na célula seguinte
-                      const proxLinha = linhas[i + 1];
-                      if (proxLinha) {
-                        // Extrai HTML para preservar formatação (negrito, itálicos, parágrafos, etc.)
-                        narrativa = proxLinha.innerHTML.trim();
-                        break;
-                      }
-                    } else if (i > 0 && textoLinha && !textoLinha.includes('Editar')) {
-                      // Se encontrou texto após "Editar Narrativa", é a narrativa com formatação HTML
-                      narrativa = linha.innerHTML.trim();
-                      break;
-                    }
-                  }
-
-                  if (narrativa) break;
-                }
-              }
-
-              return narrativa;
-            };
-
-            const narrativa = extrairNarrativa();
-            if (narrativa) r.narrativa = narrativa;
-
-            return r;
-        }
-        """
-    )
-
-    if not dados:
-        dados = {}
-    dados["paj_numero"] = numero
-    dados["paj_ano"] = ano
-    dados["paj_unidade"] = unidade
-    dados["url"] = page.url
-
-    todas_urls: list[str] = []
-    for m in dados.get("movimentacoes", []) or []:
-        for u in m.get("links_decisao", []) or []:
-            if u not in todas_urls:
-                todas_urls.append(u)
-    if todas_urls:
-        dados["urls_decisoes"] = todas_urls
-
-    # ===== SEGUNDA PASSAGEM: Extrair descricao_retorno para "Atendimento de retorno" =====
-    movimentacoes = dados.get("movimentacoes", []) or []
-
-    # 1. Encontrar e clicar em TODOS os toggles de "Atendimento de retorno"
-    await page.evaluate("""
-        () => {
-            const allTrs = document.querySelectorAll('table tbody tr');
-            for (const tr of allTrs) {
-                const cells = tr.querySelectorAll('td');
-                const fases = (cells[4]?.textContent || '').trim();
-
-                if (fases.includes('Atendimento de retorno')) {
-                    const toggler = tr.querySelector('.ui-row-toggler');
-                    if (toggler && toggler.getAttribute('aria-expanded') !== 'true') {
-                        toggler.click();
-                    }
-                }
-            }
-        }
-    """)
-
-    # 2. Aguardar que as requisições AJAX completem
-    await _wait_pf_ajax(page, timeout=5000)
-
-    # 3. Extrair seq -> conteúdo direto em JavaScript
-    mapa_conteudos = await page.evaluate("""
-        () => {
-            const resultado = {};
-            const allTrs = document.querySelectorAll('table tbody tr');
-
-            for (let i = 0; i < allTrs.length; i++) {
-                const tr = allTrs[i];
-                const cells = tr.querySelectorAll('td');
-                const seq = (cells[0]?.textContent || '').trim();
-                const fases = (cells[4]?.textContent || '').trim();
-
-                // Se esta TR tem "Atendimento de retorno"
-                if (fases.includes('Atendimento de retorno')) {
-                    // Procurar pela próxima TR (pode haver várias)
-                    for (let j = i + 1; j < Math.min(i + 5, allTrs.length); j++) {
-                        const proximaTr = allTrs[j];
-
-                        // Se encontrou uma TR expandida
-                        if (proximaTr.classList.contains('ui-expanded-row-content')) {
-                            const td = proximaTr.querySelector('td');
-                            if (td) {
-                                resultado[seq] = td.textContent.trim();
-                            }
-                            break;
-                        }
-                    }
-                }
-            }
-
-            return resultado;
-        }
-    """)
-
-    # 4. Aplicar os conteúdos extraídos às movimentações
-    for mov in movimentacoes:
-        if "Atendimento de retorno" in mov.get("fases", ""):
-            seq = str(mov.get("seq", "")).strip()
-
-            # Debug: testar diferentes formatos de chave
-            encontrou = False
-            for chave_mapa in mapa_conteudos.keys():
-                if str(chave_mapa).strip() == seq:
-                    mov["descricao_retorno"] = mapa_conteudos[chave_mapa]
-                    encontrou = True
-                    break
-
-            # Fallback: tentar direto
-            if not encontrou and seq in mapa_conteudos:
-                mov["descricao_retorno"] = mapa_conteudos[seq]
-
-    return dados
 
 
 # JS que dispara a busca rapida do SISDPU. Descobertas chave (vistas no
@@ -1543,1021 +1106,179 @@ async def buscar_paj_global(
     return dados
 
 
-async def baixar_arquivo(url: str, destino) -> bool:
-    """Baixa arquivo reaproveitando a sessao autenticada (cookies) do SISDPU.
-
-    Retorna True se o arquivo foi gravado com tamanho > 0.
-    """
-    try:
-        import httpx
-    except ImportError:
-        return False
-
-    page = await _get_page()
-    context = page.context
-    cookies = await context.cookies()
-    cookie_jar = {c["name"]: c["value"] for c in cookies}
-
-    try:
-        async with httpx.AsyncClient(
-            cookies=cookie_jar,
-            timeout=60,
-            follow_redirects=True,
-            headers={
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/127.0 Safari/537.36"
-                ),
-                "Accept": "application/pdf,*/*;q=0.8",
-            },
-        ) as c:
-            resp = await c.get(url)
-            resp.raise_for_status()
-            if not resp.content:
-                return False
-            destino.parent.mkdir(parents=True, exist_ok=True)
-            destino.write_bytes(resp.content)
-            return destino.stat().st_size > 0
-    except Exception:
-        return False
-
-
 _EXTRACAO_DOCS_JS_PATH = Path(__file__).resolve().parent / "extrair_documentos_movimentacoes.js"
 
 
 async def extrair_documentos_por_seq(
     seqs_conhecidos: list[str] | None = None,
-    deve_cancelar: Callable[[], bool] | None = None,
-    log: Callable[[str], None] | None = None,
 ) -> dict:
-    """Extrai, por seq de movimentacao, os documentos anexados (via o icone de
-    "Anexo" de cada linha) do PAJ atualmente aberto.
+    """Extrai, por seq de movimentação, os documentos anexados (via o ícone de
+    "Anexo" de cada linha) do PAJ atualmente aberto — usado pela feature
+    "Baixar PAJ Completo" (`services/paj_completo_service.py`). Porte do script
+    idêntico ao usado no PAINEL SISDPU 2.0
+    (`ingestao/extrair_documentos_movimentacoes.js`), sem a lógica de cache de
+    seqs já conhecidas entre sincronizações (o Painel SAT Central gera o PDF
+    sob demanda, sem sincronização prévia persistida — sempre reextrai tudo).
 
-    PRE-CONDICAO: a page ja deve estar no detalhamento do PAJ (chamar
-    `movimentacoes_paj(...)` antes) — mesma pre-condicao de `listar_arquivos_paj`.
+    PRE-CONDICAO: a page compartilhada já deve estar no detalhamento do PAJ
+    (ex.: logo após `buscar_paj_global(..., forcar_sessao=False)`).
 
-    `seqs_conhecidos`: seqs (str) que ja possuem `documentos` no metadata da
-    sincronizacao anterior — sao excluidas da fila, entao so processamos seqs
-    novas desde a ultima sync (mantem o custo proporcional ao que mudou).
-
-    Pilota o script `extrair_documentos_movimentacoes.js` (copia adaptada em
-    `ingestao/`, NAO o original em C:\\Claude\\Scripts\\SISDPU\\) passo a passo:
-    INIT (monta a fila) -> N chamadas de __extracaoProximo() (uma por seq,
-    clica/le/fecha o popup) -> __extracaoFinalizar() (consolida o resultado).
-
-    Retorna dict: {paj, assistido, movimentacoes_com_documentos: [{seq,
-    dataHora, movimentacao, documentos: [{tipoArquivo, descricao, nomeArquivo,
-    urlDownload}]}], total_documentos, seqsPuladas, tabela_markdown}.
-    Em caso de erro ou tabela nao encontrada, retorna {"erro": "..."}.
-    """
-
-    def _log(msg: str) -> None:
-        if log:
-            with contextlib.suppress(Exception):
-                log(msg)
-
+    Pilota o script passo a passo: INIT (monta a fila de seqs com anexo) -> N
+    chamadas de `__extracaoProximo()` (uma por seq, clica/lê/fecha o popup) ->
+    `__extracaoFinalizar()` (consolida). Retorna dict com
+    `movimentacoes_com_documentos`, `total_documentos`, `seqsPuladas`, etc."""
     page = await _get_page()
-
     js_source = _EXTRACAO_DOCS_JS_PATH.read_text(encoding="utf-8")
-    # Envolve o arquivo inteiro numa arrow function explicita — mesmo padrao
-    # usado em todo o resto deste modulo (ex: listar_arquivos_paj). Passar o
-    # conteudo bruto (que comeca com um comentario /** */) faz o Playwright
-    # nao reconhecer a string como "function-like", o que pode fazer as
-    # atribuicoes a `window.*` nao "pegarem" do jeito esperado entre chamadas
-    # seguintes de evaluate().
     await page.evaluate("(src) => { (0, eval)(src); }", js_source)
-
-    async def _finalizar_seguro() -> dict:
-        tem_estado = await page.evaluate("() => !!window.__extracaoEstado")
-        if not tem_estado:
-            _log("  [docs] estado da extracao perdido (dialogo/pagina mudou) — resultado descartado")
-            return {"movimentacoes_com_documentos": [], "total_documentos": 0}
-        return await page.evaluate("window.__extracaoFinalizar()")
-
-    init = await page.evaluate(
-        "(seqs) => window.__extracaoInit(seqs)", list(seqs_conhecidos or [])
-    )
-
+    init = await page.evaluate("(seqs) => window.__extracaoInit(seqs)", list(seqs_conhecidos or []))
     if init.get("erro"):
-        _log(f"  [docs] {init['erro']}")
         return {"erro": init["erro"], "movimentacoes_com_documentos": [], "total_documentos": 0}
-
     total_fila = init.get("totalFila", 0)
-    puladas = init.get("puladas", 0)
-    if puladas:
-        _log(f"  [docs] {puladas} seq(s) ja conhecida(s) — pulando")
     if total_fila == 0:
-        _log("  [docs] nenhuma seq nova com anexo para extrair")
-        return await _finalizar_seguro()
-
-    _log(f"  [docs] extraindo documentos de {total_fila} seq(s) nova(s)...")
-
-    try:
-        while True:
-            if deve_cancelar is not None and deve_cancelar():
-                _log("  [docs] CANCELADO pelo usuario")
-                break
-            r = await page.evaluate("window.__extracaoProximo()")
-            if r.get("fim"):
-                break
-            progresso = r.get("progresso", "?")
-            erro = r.get("erro")
-            if erro:
-                _log(f"    [docs] seq {r.get('seq')}: {erro} ({progresso})")
-            else:
-                n_docs = len(r.get("documentos", []))
-                _log(f"    [docs] seq {r.get('seq')}: {n_docs} doc(s) ({progresso})")
-    except Exception as e:
-        _log(f"  [docs] erro durante extracao: {type(e).__name__}: {e}")
-        # Garante que nao fica popup aberto atrapalhando o proximo passo (ex:
-        # listar_arquivos_paj logo em seguida, no bloco de anexos).
-        with contextlib.suppress(Exception):
-            await page.evaluate(
-                "() => document.dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape', bubbles: true}))"
-            )
-
-    return await _finalizar_seguro()
+        return await page.evaluate("window.__extracaoFinalizar()")
+    while True:
+        r = await page.evaluate("window.__extracaoProximo()")
+        if r.get("fim"):
+            break
+    return await page.evaluate("window.__extracaoFinalizar()")
 
 
-async def listar_arquivos_paj(debug: bool = False) -> dict:
-    """Clica no botao "Arquivos" do PAJ atualmente aberto e extrai a lista.
-
-    PRE-CONDICAO: a page ja deve estar no detalhamento do PAJ (chamar
-    `movimentacoes_paj(...)` antes). Nao navega — so interage com a pagina atual.
-
-    Retorna dict:
-        {
-            "ok": bool,
-            "itens": [{tipo, descricao, arquivo, row_index, todas_celulas}, ...],
-            "diag": {...}   # sempre presente; use pra debug quando itens == []
-        }
-    `diag` inclui: candidatos_botao_arquivos, clicou, dialogs_visiveis,
-    dialog_escolhido, total_linhas, linhas_filtradas_por_texto, html_snippet.
-    """
+async def baixar_arquivo_direto(url: str, destino: Path) -> int:
+    """Baixa um documento com link de download direto
+    (`/rest/download/pdf/{id}/{nome}`), reaproveitando os cookies da sessão
+    Playwright via `page.context.request` (sem precisar do servidor HTTP
+    local auxiliar usado no PAINEL SISDPU 2.0). Retorna o tamanho em bytes
+    salvo (0 em falha)."""
     page = await _get_page()
-
-    # 1) Inventariar candidatos ao botao "Arquivos" ANTES de clicar
-    diag: dict = {}
-    diag["candidatos_botao_arquivos"] = await page.evaluate(
-        """
-        () => {
-            const out = [];
-            const els = Array.from(document.querySelectorAll('a, button, span[role="button"], .ui-button'));
-            for (const el of els) {
-                const txt = (el.textContent || '').trim();
-                if (txt && /arquivo/i.test(txt) && txt.length < 40) {
-                    out.push({
-                        tag: el.tagName,
-                        texto: txt,
-                        id: el.id || '',
-                        classes: el.className || '',
-                        onclick_has: !!el.getAttribute('onclick'),
-                    });
-                }
-            }
-            return out;
-        }
-        """
-    )
-
-    # 2) Clica no link "Arquivos" — agora mais tolerante
-    clicked = await page.evaluate(
-        """
-        () => {
-            const els = Array.from(document.querySelectorAll('a, button, span[role="button"], .ui-button'));
-            // Preferencia: match EXATO por "Arquivos" depois de trim
-            for (const el of els) {
-                const txt = (el.textContent || '').trim();
-                if (txt === 'Arquivos' || txt === 'Arquivo(s)') {
-                    el.click();
-                    return 'exato';
-                }
-            }
-            // Fallback: contem "Arquivos" (mas nao "Arquivo anexo" de movimentacao)
-            for (const el of els) {
-                const txt = (el.textContent || '').trim();
-                if (/^Arquivos?$/i.test(txt) || /^Arquivos\\s*\\(\\d+\\)$/.test(txt)) {
-                    el.click();
-                    return 'regex';
-                }
-            }
-            // Fallback extremo: qualquer elemento com "Arquivo" curto
-            for (const el of els) {
-                const txt = (el.textContent || '').trim();
-                if (/arquivo/i.test(txt) && txt.length < 15) {
-                    el.click();
-                    return 'fuzzy:' + txt;
-                }
-            }
-            return '';
-        }
-        """
-    )
-    diag["clicou"] = clicked or "NADA"
-    if not clicked:
-        return {"ok": False, "itens": [], "diag": diag}
-
-    # Aguarda AJAX + eventual navegacao (o link "Arquivos" navega para outra tela).
-    # Tenta networkidle primeiro; se falhar, cai pra wait_pf_ajax + sleep.
-    try:
-        await page.wait_for_load_state("networkidle", timeout=10000)
-    except Exception:
-        await _wait_pf_ajax(page, timeout=15000)
-    await page.wait_for_timeout(1500)
-
-    # 3) Inventariar dialogs REALMENTE visiveis (filtra aria-hidden=true)
-    diag["dialogs_visiveis"] = await page.evaluate(
-        """
-        () => {
-            const dialogs = document.querySelectorAll('.ui-dialog');
-            return Array.from(dialogs)
-                .filter(d => {
-                    if (d.getAttribute('aria-hidden') === 'true') return false;
-                    if (d.classList.contains('ui-overlay-hidden')) return false;
-                    const st = window.getComputedStyle(d);
-                    if (st.display === 'none' || st.visibility === 'hidden') return false;
-                    return true;
-                })
-                .map(d => ({
-                    id: d.id || '',
-                    titulo: (d.querySelector('.ui-dialog-title')?.textContent || '').trim(),
-                    linhas_tabela: d.querySelectorAll('table tbody tr').length,
-                }));
-        }
-        """
-    )
-
-    # Registra URL pra saber se navegou
-    with contextlib.suppress(Exception):
-        diag["url_apos_click"] = page.url
-
-    # 4) Extrai linhas — a pagina de Arquivos do SISDPU tem MULTIPLAS tabelas,
-    # uma por categoria ("Juntada de documento", "Concluso ao defensor",
-    # "Oficio/Carta/Comunicacao expedida", etc.). Iteramos TODAS as tabelas
-    # visiveis com botoes "Visualizar" em ordem do DOM e concatenamos as linhas
-    # com indice global. A funcao baixar_anexo_por_indice usa a MESMA estrategia
-    # de flatten para que `row_index` seja consistente.
-    extrato = await page.evaluate(
-        """
-        () => {
-            const diag = {estrategia: '', total_linhas: 0, linhas_filtradas: 0,
-                          tabelas_analisadas: 0, tabelas_com_visualizar: 0,
-                          categorias: []};
-
-            const isVisivel = (el) => {
-                let cur = el;
-                while (cur) {
-                    if (cur.nodeType === 1) {
-                        if (cur.getAttribute && cur.getAttribute('aria-hidden') === 'true') return false;
-                        if (cur.classList && (
-                            cur.classList.contains('ui-overlay-hidden') ||
-                            cur.classList.contains('ui-hidden-container')
-                        )) {
-                            if (cur.getAttribute('aria-hidden') === 'true') return false;
-                        }
-                    }
-                    cur = cur.parentElement;
-                }
-                try {
-                    const r = el.getBoundingClientRect();
-                    if (r.width === 0 && r.height === 0) return false;
-                } catch (e) {}
-                return true;
-            };
-
-            // Tenta extrair o rotulo da categoria de uma tabela: o texto curto
-            // mais proximo (header/legend/div) que aparece imediatamente antes.
-            const detectaCategoria = (tbl) => {
-                let prev = tbl.previousElementSibling;
-                let tentativas = 0;
-                while (prev && tentativas < 6) {
-                    const t = (prev.textContent || '').trim();
-                    if (t && t.length < 100 && t.length > 2 && !/^(Seq\\.|Nenhum registro)/i.test(t)) {
-                        return t.split('\\n')[0].trim().slice(0, 80);
-                    }
-                    prev = prev.previousElementSibling;
-                    tentativas++;
-                }
-                // Fallback: legend de fieldset ancestral
-                let p = tbl.parentElement;
-                while (p) {
-                    const lg = p.querySelector(':scope > legend, :scope > .ui-fieldset-legend');
-                    if (lg) {
-                        const t = (lg.textContent || '').trim();
-                        if (t) return t.slice(0, 80);
-                    }
-                    p = p.parentElement;
-                }
-                return '';
-            };
-
-            const tables = document.querySelectorAll('table');
-            diag.tabelas_analisadas = tables.length;
-
-            // Coleta tabelas visiveis com links "Visualizar"
-            const uteis = [];
-            for (const tbl of tables) {
-                const rows = tbl.querySelectorAll('tbody tr');
-                if (rows.length === 0) continue;
-                let comVis = 0;
-                for (const r of rows) {
-                    const alvos = r.querySelectorAll('a, button, span[role="button"]');
-                    for (const a of alvos) {
-                        if (/visualizar/i.test((a.textContent || '').trim())) { comVis++; break; }
-                    }
-                }
-                if (comVis === 0) continue;
-                if (!isVisivel(tbl)) continue;
-                uteis.push(tbl);
-            }
-            diag.tabelas_com_visualizar = uteis.length;
-
-            if (uteis.length === 0) {
-                // Fallback: tabelas visiveis cujos headers mencionem "arquivo"
-                for (const tbl of tables) {
-                    const ths = Array.from(tbl.querySelectorAll('th')).map(th => (th.textContent || '').toLowerCase());
-                    if (!/arquivo|documento/.test(ths.join('|'))) continue;
-                    if (!tbl.querySelector('tbody tr')) continue;
-                    if (!isVisivel(tbl)) continue;
-                    uteis.push(tbl);
-                }
-                if (uteis.length > 0) diag.estrategia = 'tabela_por_header';
-            } else {
-                diag.estrategia = uteis.length > 1
-                    ? `multi_tabela_visualizar (${uteis.length})`
-                    : 'tabela_com_visualizar';
-            }
-
-            if (uteis.length === 0) {
-                diag.erro = 'nenhuma_tabela_util_encontrada';
-                return {resultado: [], diag};
-            }
-
-            // Flatten: percorre todas as tabelas em ordem do DOM e concatena as
-            // linhas com indice global crescente. A categoria de cada tabela e'
-            // anexada a cada linha — util pra naming/diagnostico.
-            const resultado = [];
-            let idx = 0;
-            const snippets = [];
-            for (const tbl of uteis) {
-                const categoria = detectaCategoria(tbl);
-                diag.categorias.push({categoria: categoria, linhas: 0});
-                const catIdx = diag.categorias.length - 1;
-                const rows = tbl.querySelectorAll('tbody tr');
-                diag.total_linhas += rows.length;
-                for (const tr of rows) {
-                    if (tr.classList.contains('ui-widget-header')) continue;
-                    const cells = tr.querySelectorAll('td');
-                    if (cells.length < 5) continue;  // Precisa das 5 primeiras colunas no mínimo
-                    const textos = Array.from(cells).map(c => (c.textContent || '').trim());
-                    // Primeira coluna DEVE ser um número válido (Seq.)
-                    const seq = textos[0] || '';
-                    if (!seq || !/^\\d+$/.test(seq)) continue;
-                    const alvos = tr.querySelectorAll('a, button, span[role="button"]');
-                    let temVis = false;
-                    for (const a of alvos) {
-                        if (/visualizar/i.test((a.textContent || '').trim())) { temVis = true; break; }
-                    }
-                    if (!temVis) continue;
-                    // Extrai nome do arquivo DIRETAMENTE do link "Visualizar" (fonte de verdade)
-                    const linkVis = tr.querySelector('a, button, span[role="button"]');
-                    let nome_arquivo = '';
-                    let href = '';
-                    if (linkVis) {
-                        // Tenta extrair em ordem de confiabilidade:
-                        // 1. Atributo download (HTML5)
-                        // 2. Atributo data-filename (customizado)
-                        // 3. Href com padrão comuns (ex: /download/123)
-                        const downloadAttr = linkVis.getAttribute('download');
-                        const dataNome = linkVis.getAttribute('data-filename');
-                        let hrefAttr = linkVis.getAttribute('href') || '';
-
-                        // Torna href absoluto se for relativo
-                        if (hrefAttr && !hrefAttr.startsWith('http')) {
-                            hrefAttr = window.location.origin + (hrefAttr.startsWith('/') ? '' : '/sisdpu/') + hrefAttr;
-                        }
-                        href = hrefAttr;
-
-                        if (downloadAttr) nome_arquivo = downloadAttr;
-                        else if (dataNome) nome_arquivo = dataNome;
-                        else if (href && /\\.(pdf|docx?|xlsx?|txt|zip|jpg|png|gif)$/i.test(href)) {
-                            // Se href tem extensão, usar último segmento como nome
-                            nome_arquivo = href.split('/').pop();
-                        }
-                    }
-                    // Fallback para coluna "Arquivo" se não conseguir extrair do link
-                    if (!nome_arquivo) nome_arquivo = textos[4] || '';
-
-                    resultado.push({
-                        row_index: idx++,
-                        seq: textos[0] || '',
-                        data: textos[1] || '',
-                        descricao: textos[2] || '',
-                        tipo_arquivo: textos[3] || '',
-                        arquivo: nome_arquivo,
-                        href: href,
-                        categoria: categoria,
-                        todas_celulas: textos,
-                    });
-                    diag.categorias[catIdx].linhas++;
-                }
-                try { snippets.push((tbl.outerHTML || '').slice(0, 800)); } catch (e) {}
-            }
-            // Remove duplicatas exatas (seq + arquivo idênticos)
-            const vistos = new Set();
-            const resultadoDeduplic = [];
-            for (const item of resultado) {
-                const chave = item.seq + '|' + item.arquivo;
-                if (!vistos.has(chave)) {
-                    vistos.add(chave);
-                    resultadoDeduplic.push(item);
-                }
-            }
-            const n_removidas = resultado.length - resultadoDeduplic.length;
-            if (n_removidas > 0) diag.linhas_removidas = n_removidas;
-
-            // Recalcula row_index sequencial (0, 1, 2, ...) após desduplicação
-            for (let i = 0; i < resultadoDeduplic.length; i++) {
-                resultadoDeduplic[i].row_index = i;
-            }
-
-            diag.linhas_filtradas = resultadoDeduplic.length;
-            diag.html_snippet = snippets.join('\\n---\\n').slice(0, 2000);
-            return {resultado: resultadoDeduplic, diag};
-        }
-        """
-    )
-
-    diag.update(extrato.get("diag", {}))
-    itens = extrato.get("resultado", []) or []
-    return {"ok": True, "itens": itens, "diag": diag}
-
-
-_JS_MARCAR_POR_INDICE = """
-(idx) => {
-    const isVisivel = (el) => {
-        let cur = el;
-        while (cur) {
-            if (cur.nodeType === 1) {
-                if (cur.getAttribute && cur.getAttribute('aria-hidden') === 'true') return false;
-            }
-            cur = cur.parentElement;
-        }
-        try {
-            const r = el.getBoundingClientRect();
-            if (r.width === 0 && r.height === 0) return false;
-        } catch (e) {}
-        return true;
-    };
-    const tables = document.querySelectorAll('table');
-    const uteis = [];
-    for (const tbl of tables) {
-        const rows = tbl.querySelectorAll('tbody tr');
-        if (rows.length === 0) continue;
-        // Filtra tabelas que sao placeholders "Nenhum registro"
-        let todosVazios = true;
-        for (const r of rows) {
-            const cells = r.querySelectorAll('td');
-            if (cells.length === 0) continue;
-            const textos = Array.from(cells).map(c => (c.textContent || '').trim());
-            if (!/nenhum\\s+registro/i.test(textos.join(' '))) {
-                todosVazios = false;
-                break;
-            }
-        }
-        if (todosVazios) continue;
-
-        let comVis = 0;
-        for (const r of rows) {
-            const alvos = r.querySelectorAll('a, button, span[role="button"]');
-            for (const a of alvos) {
-                if (/visualizar/i.test((a.textContent || '').trim())) { comVis++; break; }
-            }
-        }
-        if (comVis === 0) continue;
-        if (!isVisivel(tbl)) continue;
-        uteis.push(tbl);
-    }
-    if (uteis.length === 0) return false;
-    const linhas = [];
-    for (const tbl of uteis) {
-        const rows = Array.from(tbl.querySelectorAll('tbody tr'))
-            .filter(tr => {
-                if (tr.classList.contains('ui-widget-header')) return false;
-                if (tr.querySelectorAll('td').length === 0) return false;
-                const cells = tr.querySelectorAll('td');
-                const textos = Array.from(cells).map(c => (c.textContent || '').trim());
-                const seq = (textos[0] || '').trim();
-                if (!seq || /nenhum|cabeçalho|conclus[aã]o|juntada|oficio/i.test(seq)) return false;
-                const alvos = tr.querySelectorAll('a, button, span[role="button"]');
-                for (const a of alvos) {
-                    if (/visualizar/i.test((a.textContent || '').trim())) return true;
-                }
-                return false;
-            });
-        for (const r of rows) linhas.push(r);
-    }
-    if (idx >= linhas.length) return false;
-    const row = linhas[idx];
-    const alvos = row.querySelectorAll('a, button, span[role="button"]');
-    for (const el of alvos) {
-        if (/visualizar/i.test((el.textContent || '').trim())) {
-            el.setAttribute('data-dpu-pick', '1');
-            return true;
-        }
-    }
-    return false;
-}
-"""
-
-_JS_MARCAR_POR_SEQ = """
-(seq) => {
-    // Busca a linha pela coluna Seq. (primeira coluna) em TODAS as tabelas.
-    // Mais robusto que posicao quando a pagina e' atualizada entre downloads.
-    const tables = document.querySelectorAll('table');
-    for (const tbl of tables) {
-        for (const tr of tbl.querySelectorAll('tbody tr')) {
-            const cells = tr.querySelectorAll('td');
-            if (cells.length === 0) continue;
-            if ((cells[0].textContent || '').trim() !== seq) continue;
-            const alvos = tr.querySelectorAll('a, button, span[role="button"]');
-            for (const a of alvos) {
-                if (/visualizar/i.test((a.textContent || '').trim())) {
-                    a.setAttribute('data-dpu-pick', '1');
-                    return true;
-                }
-            }
-        }
-    }
-    return false;
-}
-"""
-
-_JS_CLICAR_ARQUIVOS = """
-() => {
-    const els = Array.from(document.querySelectorAll('a, button, span[role="button"], .ui-button'));
-    for (const el of els) {
-        const txt = (el.textContent || '').trim();
-        if (txt === 'Arquivos' || txt === 'Arquivo(s)') { el.click(); return 'exato'; }
-    }
-    for (const el of els) {
-        const txt = (el.textContent || '').trim();
-        if (/^Arquivos?$/i.test(txt) || /^Arquivos\\s*\\(\\d+\\)$/.test(txt)) { el.click(); return 'regex'; }
-    }
-    return '';
-}
-"""
-
-# Extensoes conhecidas para deteccao via nome de arquivo (ultima extensao valida).
-_EXTS_ARQUIVO = {
-    ".pdf", ".docx", ".doc", ".xlsx", ".xls", ".pptx", ".ppt",
-    ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".tif", ".webp",
-    ".txt", ".zip", ".rar", ".7z", ".tar", ".gz",
-    ".mp3", ".mp4", ".avi", ".mov", ".wmv",
-    ".csv", ".xml", ".html", ".htm",
-    ".odt", ".ods", ".odp", ".rtf",
-}
-
-
-def extrair_id_arquivo(url: str) -> str:
-    """Extrai o ID numerico do documento a partir da URL de download do SISDPU.
-
-    Ex: '.../rest/download/pdf/42296157/Nome.pdf' -> '42296157'.
-    Esse ID pertence ao ARQUIVO (nao a seq/listagem) e e' o mesmo em qualquer
-    mecanismo que o descubra (listar_arquivos_paj ou extracao por seq de
-    movimentacao) — usado como chave de juncao para nomear os arquivos
-    baixados de forma que o frontend consiga casar o link da coluna
-    "Documentos" com a copia local ja baixada, sem depender do nome do
-    arquivo (que pode se repetir, ex: "email.pdf").
-    """
-    m = re.search(r"/(\d+)/[^/]*$", url or "")
-    return m.group(1) if m else ""
-
-
-def _ext_de_nome_arquivo(nome: str) -> str:
-    """Extrai extensao do FINAL do nome de arquivo validando contra lista conhecida.
-
-    Usa rfind('.') para pegar sempre o ULTIMO ponto — evita interpretar pontos
-    no meio do nome (ex: '1234-56.789.4.01.2345') como extensao.
-    Retorna '' se nao reconhecida.
-    """
-    if not nome:
-        return ""
-    lower = nome.lower().strip()
-    last = lower.rfind(".")
-    if last < 0 or last == len(lower) - 1:
-        return ""
-    ext = lower[last:]
-    return ext if ext in _EXTS_ARQUIVO else ""
-
-
-async def extrair_lista_arquivos_paj() -> list[dict]:
-    """Extrai a lista de arquivos do PAJ atualmente aberto via JavaScript.
-
-    Itera todas as tabelas visiveis e retorna uma lista de documentos com:
-    {seq, data, nomeArq, href}
-
-    Estrategia identica a SISDPU-AnalisarPAJ2Cat skill.
-    """
-    page = await _get_page()
-
-    resultado = await page.evaluate(
-        """
-        () => {
-            const docs = [];
-            const isVisivel = (el) => {
-                let cur = el;
-                while (cur) {
-                    if (cur.nodeType === 1) {
-                        if (cur.getAttribute && cur.getAttribute('aria-hidden') === 'true') return false;
-                    }
-                    cur = cur.parentElement;
-                }
-                try {
-                    const r = el.getBoundingClientRect();
-                    if (r.width === 0 && r.height === 0) return false;
-                } catch (e) {}
-                return true;
-            };
-
-            const tables = document.querySelectorAll('table');
-            const uteis = [];
-
-            // Coleta tabelas visiveis com links "Visualizar"
-            for (const tbl of tables) {
-                const rows = tbl.querySelectorAll('tbody tr');
-                if (rows.length === 0) continue;
-                let comVis = 0;
-                for (const r of rows) {
-                    const alvos = r.querySelectorAll('a, button, span[role="button"]');
-                    for (const a of alvos) {
-                        if (/visualizar/i.test((a.textContent || '').trim())) { comVis++; break; }
-                    }
-                }
-                if (comVis === 0) continue;
-                if (!isVisivel(tbl)) continue;
-                uteis.push(tbl);
-            }
-
-            // Itera todas as tabelas uteis e coleta arquivos
-            for (const tbl of uteis) {
-                const rows = tbl.querySelectorAll('tbody tr');
-                for (const tr of rows) {
-                    const cells = tr.querySelectorAll('td');
-                    if (cells.length < 5) continue;
-
-                    const seq = (cells[0]?.textContent || '').trim();
-                    if (!seq || !/^\\d+$/.test(seq)) continue;
-
-                    const data = (cells[1]?.textContent || '').trim();
-
-                    // Nome do arquivo vem da coluna cells[4] (coluna "Arquivo")
-                    const nomeArq = (cells[4]?.textContent || '').trim().split('\\n')[0].trim();
-
-                    // Link "Visualizar" — usar getAttribute('href') em vez de .href
-                    // para evitar parametros JSF que quebram downloads
-                    let href = '';
-                    const alvos = tr.querySelectorAll('a, button, span[role="button"]');
-                    for (const a of alvos) {
-                        if (/visualizar/i.test((a.textContent || '').trim())) {
-                            href = a.getAttribute('href') || '';
-                            break;
-                        }
-                    }
-
-                    if (nomeArq && href) {
-                        docs.push({
-                            seq: seq,
-                            data: data,
-                            nomeArq: nomeArq,
-                            href: href
-                        });
-                    }
-                }
-            }
-
-            return docs;
-        }
-        """
-    )
-
-    return resultado or []
-
-
-async def baixar_todos_arquivos(
-    pasta_destino: Path,
-    lista_arquivos: list[dict] | None = None,
-    log: Callable[[str], None] | None = None,
-    seq_por_file_id: dict[str, int] | None = None,
-) -> dict:
-    """Baixa todos os arquivos do PAJ via JavaScript fetch + local server.
-
-    Se lista_arquivos não for fornecida, extrai via listar_arquivos_paj().
-    Caso contrário, usa a lista ja fornecida (cada item deve ter: arquivo, seq, data, href ou as keys esperadas).
-
-    `seq_por_file_id`: mapa {id_do_arquivo (str) -> seq_real (int)} vindo da
-    extracao por seq de movimentacao (`extrair_documentos_por_seq`). Usado
-    pra nomear o arquivo com a seq REAL da movimentacao — se o id do arquivo
-    (extraido do href) nao estiver no mapa, cai no `seq` fornecido pela lista
-    de origem (listar_arquivos_paj, que e' so um indice de listagem).
-
-    Estrategia:
-    1. Extrai lista de arquivos (ou usa fornecida)
-    2. Inicia local server (download_server.py) na porta 8765
-    3. Para cada arquivo: fetch() + Base64 + POST ao servidor local
-    4. Servidor salva arquivo em disco
-    5. Mata o processo do servidor
-
-    Retorna {baixados: int, erros: list, total: int}
-    """
-    import subprocess
-    import asyncio
-
-    def _log(msg: str) -> None:
-        if log:
-            with contextlib.suppress(Exception):
-                log(msg)
-
-    pasta_destino = Path(pasta_destino)
-    pasta_destino.mkdir(parents=True, exist_ok=True)
-
-    # 1) Extrai lista de arquivos
-    _log("[fetch] preparando downloads...")
-    if lista_arquivos is None:
-        _log("[fetch] extraindo lista de arquivos...")
-        resultado = await listar_arquivos_paj()
-        docs = resultado.get("itens", []) if isinstance(resultado, dict) else (resultado or [])
-    else:
-        docs = lista_arquivos
-
-    # Normaliza para formato esperado pelo fetch (precisa de: seq, data, nomeArq, href)
-    # Converte da lista de listar_arquivos_paj que tem: seq, data, descricao, tipo_arquivo, arquivo
-    docs_normalizados = []
-    for doc in docs:
-        seq = doc.get("seq", "?")
-        data = doc.get("data", "")
-        # Nome do arquivo: tenta 'arquivo' primeiro (de listar_arquivos_paj), depois 'nomeArq' (de extrair_lista_arquivos_paj)
-        nome_arq = doc.get("arquivo") or doc.get("nomeArq", "arquivo")
-        # href: tenta 'href' direto ou reconstrói... deixa vazio se não houver
-        href = doc.get("href", "")
-
-        docs_normalizados.append({
-            "seq": seq,
-            "data": data,
-            "nomeArq": nome_arq,
-            "href": href,
-        })
-
-    docs = docs_normalizados
-    _log(f"[fetch] {len(docs)} arquivo(s) encontrado(s)")
-
-    if not docs:
-        return {"baixados": 0, "erros": [], "total": 0}
-
-    # 2) Inicia servidor local
-    _log("[fetch] iniciando servidor local na porta 8765...")
-
-    # Tenta em ordem: projeto local, depois PREV4
-    server_path = Path(__file__).resolve().parents[1] / ".claude" / "download_server.py"
-    if not server_path.exists():
-        server_path = Path("C:/Claude/DPU/PREV4/.claude/download_server.py")
-
-    if not server_path.exists():
-        _log(f"[fetch] ERRO: servidor {server_path} não encontrado")
-        return {"baixados": 0, "erros": ["servidor download_server.py não encontrado"], "total": len(docs)}
-
-    proc = None
-    try:
-        # Inicia o servidor como background process (Windows)
-        # Usa cwd do diretório do projeto para que paths relativos funcionem
-        cwd = Path(__file__).resolve().parents[1].parent
-
-        proc = subprocess.Popen(
-            ["python", str(server_path)],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            cwd=str(cwd),
-        )
-        await asyncio.sleep(1)  # Aguarda servidor iniciar
-    except Exception as e:
-        _log(f"[fetch] ✗ falha ao iniciar servidor: {type(e).__name__}")
-        if proc:
-            with contextlib.suppress(Exception):
-                proc.terminate()
-        return {"baixados": 0, "erros": [f"falha ao iniciar servidor"], "total": len(docs)}
-
-    page = await _get_page()
-    context = page.context
-    baixados = 0
-    erros = []
-
-    try:
-        # 3) Download via Playwright (usa cookies da session autenticada) + POST ao servidor
-        import httpx
-        import base64
-
-        # Extrai cookies do contexto Playwright para passar ao httpx
-        cookies_list = await context.cookies()
-        cookies_dict = {c["name"]: c["value"] for c in cookies_list}
-
-        for idx, doc in enumerate(docs, start=1):
-            seq = doc.get("seq", "?")
-            nomeArq = doc.get("nomeArq", "arquivo")
-            href = doc.get("href", "")
-
-            # Formata nome para POST: seqNNN - ID - NOME
-            # O ID (extraido do href) e' a chave estavel que o frontend usa
-            # pra casar o link da coluna "Documentos" com este arquivo local
-            # — nao depende do nome (que pode se repetir, ex: "email.pdf").
-            # A seq usa a REAL (do mapa por id), com 3 digitos pra ordenar
-            # certo na pasta quando passar de 100 seqs.
-            file_id = extrair_id_arquivo(href)
-            seq_real = (seq_por_file_id or {}).get(file_id, seq)
-            try:
-                seq_fmt = f"{int(seq_real):03d}"
-            except (TypeError, ValueError):
-                seq_fmt = str(seq_real)
-
-            nome_para_post = f"seq{seq_fmt} - {file_id or '0'} - {nomeArq}"
-
-            _log(f"[{idx}/{len(docs)}]   {nomeArq}")
-
-            # Se href estiver vazio, trata como erro
-            if not href:
-                _log(f"               ... ERRO     ✗ href vazio")
-                erros.append(f"{nomeArq}: href vazio")
-                continue
-
-            try:
-                # Fetch do arquivo via Playwright (reutiliza cookies autenticados)
-                pasta_abs = str(pasta_destino).replace("\\", "/")
-
-                # Usa httpx síncrono com cookies do contexto do Playwright
-                async with httpx.AsyncClient(cookies=cookies_dict, verify=False) as client:
-                    # Fetch arquivo
-                    resp = await client.get(href, follow_redirects=True, timeout=30.0)
-                    if resp.status_code != 200:
-                        _log(f"               ... ERRO     ✗ HTTP {resp.status_code}")
-                        erros.append(f"{nomeArq}: HTTP {resp.status_code}")
-                        continue
-
-                    conteudo = resp.content
-                    tamanho = len(conteudo)
-
-                    if tamanho == 0:
-                        _log(f"               ... ERRO     ✗ vazio")
-                        erros.append(f"{nomeArq}: arquivo vazio")
-                        continue
-
-                    # Formata tamanho em KB/MB
-                    if tamanho < 1024 * 1024:
-                        tam_str = f"{tamanho / 1024:.1f} KB"
-                    else:
-                        tam_str = f"{tamanho / (1024 * 1024):.1f} MB"
-
-                    # Converte para Base64
-                    b64_data = base64.b64encode(conteudo).decode("ascii")
-
-                    # POST ao servidor local
-                    try:
-                        post_resp = await client.post(
-                            "http://127.0.0.1:8765",
-                            json={
-                                "filename": nome_para_post,
-                                "data": b64_data,
-                                "target": pasta_abs,
-                            },
-                            timeout=10.0,
-                        )
-                        if post_resp.status_code == 200:
-                            _log(f"               ... Concluído    ✓ {tam_str}")
-                            baixados += 1
-                        else:
-                            _log(f"               ... ERRO     ✗ POST {post_resp.status_code}")
-                            erros.append(f"{nomeArq}: POST HTTP {post_resp.status_code}")
-                    except Exception as e:
-                        _log(f"               ... ERRO     ✗ {type(e).__name__}")
-                        erros.append(f"{nomeArq}: POST {type(e).__name__}")
-
-            except Exception as e:
-                _log(f"               ... ERRO     ✗ {type(e).__name__}")
-                erros.append(f"{nomeArq}: {type(e).__name__}")
-
-    finally:
-        # 4) Mata o servidor
-        if proc:
-            try:
-                proc.terminate()
-                proc.wait(timeout=2)
-            except Exception:
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
-
-    if baixados == len(docs):
-        _log(f"[fetch] ✓ {baixados} arquivo(s) baixado(s) com sucesso")
-    else:
-        _log(f"[fetch] ⚠ {baixados}/{len(docs)} arquivo(s) baixado(s) — {len(erros)} erro(s)")
-    return {
-        "baixados": baixados,
-        "erros": erros,
-        "total": len(docs),
-    }
-
-
-async def baixar_anexo_por_indice(
-    row_index: int,
-    destino,
-    seq: str = "",
-    ext_hint: str = "",
-):
-    """DEPRECADO: Mantido por compatibilidade. Use extrair_lista_arquivos_paj()
-    + baixar_todos_arquivos() em vez disso.
-
-    Clica em "Visualizar" da linha `row_index` e salva o arquivo baixado.
-    """
-    from pathlib import Path as _Path
-
-    destino = _Path(destino)
+    destino = Path(destino)
     destino.parent.mkdir(parents=True, exist_ok=True)
+    resp = await page.context.request.get(url)
+    if not resp.ok:
+        return 0
+    corpo = await resp.body()
+    destino.write_bytes(corpo)
+    return len(corpo)
 
-    page = await _get_page()
 
-    found = await page.evaluate(_JS_MARCAR_POR_INDICE, row_index)
-    metodo = "indice"
-
-    if not found and seq:
-        metodo = "seq-fallback"
-        with contextlib.suppress(Exception):
-            await page.evaluate(_JS_CLICAR_ARQUIVOS)
-            try:
-                await page.wait_for_load_state("networkidle", timeout=8000)
-            except Exception:
-                await _wait_pf_ajax(page, timeout=10000)
-            await page.wait_for_timeout(1000)
-        found = await page.evaluate(_JS_MARCAR_POR_SEQ, seq)
-
-    if not found:
-        return None
-
-    def _limpar_marker():
-        with contextlib.suppress(Exception):
-            return page.evaluate(
-                "() => document.querySelectorAll('[data-dpu-pick]')"
-                ".forEach(el => el.removeAttribute('data-dpu-pick'))"
-            )
-
+async def _abrir_popup_documentos_seq(page: Page, seq: str) -> bool:
+    """Clica no ícone de anexo da linha `seq` da tabela de movimentações e
+    espera o popup de documentos ('Arquivo' no cabeçalho) abrir e ficar
+    visível. PRE-CONDICAO: a page já está no detalhamento do PAJ. Retorna
+    True se o popup abriu."""
+    clicou = await page.evaluate(
+        """
+        (seqAlvo) => {
+            const tables = document.querySelectorAll('table');
+            let tableMov = null;
+            for (const t of tables) {
+                const headers = Array.from(t.querySelectorAll('thead th, tbody tr:first-child td'))
+                    .map(h => h.textContent.trim()).filter(Boolean);
+                if (headers.includes('Seq.') && headers.includes('Data/Hora')) { tableMov = t; break; }
+            }
+            if (!tableMov) return false;
+            const rows = tableMov.querySelectorAll('tbody tr');
+            for (const row of rows) {
+                const cells = row.querySelectorAll('td');
+                if (!cells.length) continue;
+                if ((cells[0]?.textContent || '').trim() !== String(seqAlvo)) continue;
+                const clickable = cells[1]?.querySelector('a, button, [role="button"], [onclick], img[onclick], span[onclick]');
+                if (!clickable) return false;
+                clickable.click();
+                return true;
+            }
+            return false;
+        }
+        """,
+        seq,
+    )
+    if not clicou:
+        return False
     try:
-        async with page.expect_event("download", timeout=60000) as dl_info:
-            await page.click('[data-dpu-pick="1"]')
-        download = await dl_info.value
-
-        sugerido = (download.suggested_filename or "").strip()
-        ext_sugerida = _Path(sugerido).suffix.lower() if sugerido else ""
-        if not ext_sugerida or ext_sugerida not in _EXTS_ARQUIVO:
-            ext_sugerida = ext_hint if ext_hint else ".bin"
-
-        atual_suffix = destino.suffix.lower()
-        if atual_suffix and atual_suffix in _EXTS_ARQUIVO:
-            destino_final = destino
-        else:
-            destino_final = destino.with_suffix(ext_sugerida)
-
-        await download.save_as(str(destino_final))
-    except Exception as e:
-        await _limpar_marker()
-        return None
-
-    await _limpar_marker()
-
-    if destino_final.exists() and destino_final.stat().st_size > 0:
-        return destino_final
-    return None
-
-
-async def fechar_dialogo_arquivos() -> None:
-    """Fecha o dialogo 'Arquivos' se estiver aberto (para nao interferir em outro PAJ)."""
-    page = await _get_page()
-    try:
-        await page.evaluate(
+        await page.wait_for_function(
             """
             () => {
-                const dialogs = document.querySelectorAll('.ui-dialog:not(.ui-overlay-hidden)');
-                for (const d of dialogs) {
-                    const titulo = d.querySelector('.ui-dialog-title');
-                    if (titulo && /arquivo/i.test(titulo.textContent || '')) {
-                        const btn = d.querySelector('.ui-dialog-titlebar-close');
-                        if (btn) btn.click();
-                    }
+                const tables = document.querySelectorAll('table');
+                for (let j = tables.length - 1; j >= Math.max(0, tables.length - 40); j--) {
+                    const headers = Array.from(tables[j].querySelectorAll('thead th, tbody tr:first-child td'))
+                        .map(h => h.textContent.trim()).filter(Boolean);
+                    if (headers.includes('Arquivo') && tables[j].offsetParent !== null) return true;
                 }
+                return false;
             }
-            """
+            """,
+            timeout=10000,
         )
-        await page.wait_for_timeout(500)
+    except PWTimeoutError:
+        return False
+    return True
+
+
+async def _fechar_popup_documentos(page: Page) -> None:
+    with contextlib.suppress(Exception):
+        await page.keyboard.press("Escape")
+        await page.wait_for_timeout(400)
+
+
+async def baixar_documento_via_commandlink(seq: str, nome_arquivo: str, destino: Path) -> Path | None:
+    """Baixa UM documento sem link de download direto (anexos tipo imagem
+    "Documentos do Assistido", e petições .doc/.docx) — vêm como
+    `<p:commandLink>` do PrimeFaces (href="#" + clique dispara um POST do
+    formulário inteiro), então um GET simples não funciona. Clica DE VERDADE
+    no elemento (localizado pelo NOME do arquivo — o id do elemento é
+    regenerado a cada reabertura do popup, não é estável) e captura o evento
+    `download` do Playwright. PRE-CONDICAO: a page já está no detalhamento
+    do PAJ — abre e fecha o popup da seq sozinho."""
+    page = await _get_page()
+    destino = Path(destino)
+    destino.parent.mkdir(parents=True, exist_ok=True)
+
+    if not await _abrir_popup_documentos_seq(page, seq):
+        return None
+
+    try:
+        async with page.expect_event("download", timeout=30000) as dl_info:
+            clicou = await page.evaluate(
+                """
+                (nomeAlvo) => {
+                    const normalizar = (s) => (s || '')
+                        .normalize('NFD').replace(/[\\u0300-\\u036f]/g, '')
+                        .replace(/\\s+/g, ' ').trim().toLowerCase();
+                    const alvo = normalizar(nomeAlvo);
+                    const tables = document.querySelectorAll('table');
+                    for (const t of tables) {
+                        const headers = Array.from(t.querySelectorAll('thead th')).map(h => h.textContent.trim());
+                        const idxArquivo = headers.findIndex(h => h.toLowerCase() === 'arquivo');
+                        if (idxArquivo === -1) continue;
+                        const rows = Array.from(t.querySelectorAll('tbody tr'));
+                        for (const row of rows) {
+                            const cells = row.querySelectorAll('td');
+                            if (!cells.length || !cells[idxArquivo]) continue;
+                            if (normalizar(cells[idxArquivo].textContent) !== alvo) continue;
+                            const link = row.querySelector('a');
+                            if (link && link.getAttribute('href') === '#') { link.click(); return true; }
+                        }
+                        const semLinkDireto = rows
+                            .map((row) => row.querySelector('a[href="#"]'))
+                            .filter(Boolean);
+                        if (semLinkDireto.length === 1) { semLinkDireto[0].click(); return true; }
+                    }
+                    return false;
+                }
+                """,
+                nome_arquivo,
+            )
+            if not clicou:
+                raise RuntimeError(f"link do documento '{nome_arquivo}' não encontrado no popup")
+        download = await dl_info.value
+        await download.save_as(str(destino))
     except Exception:
-        pass
+        await _fechar_popup_documentos(page)
+        return None
+
+    await _fechar_popup_documentos(page)
+    if destino.exists() and destino.stat().st_size > 0:
+        return destino
+    return None
 
 
 async def fechar() -> None:

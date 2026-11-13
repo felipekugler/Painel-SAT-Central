@@ -35,9 +35,11 @@ CRED_FILE = Path(config.OFICIO_GERAL) / "_cofre.enc"
 _ITERACOES = 240_000  # custo do PBKDF2 (dificulta força bruta da senha-mestra)
 
 # Sistemas conhecidos (rótulos para exibição). O cofre em si é agnóstico e
-# aceita qualquer chave — mas este painel só cadastra o SISDPU.
+# aceita qualquer chave.
 SISTEMAS = {
     "sisdpu": "SISDPU",
+    "sat": "SAT Central (GERID)",
+    "capsolver": "CapSolver (CAPTCHA do SAT)",  # usuário = e-mail da conta; senha = chave de API
 }
 
 
