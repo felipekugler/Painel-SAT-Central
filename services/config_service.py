@@ -262,6 +262,12 @@ def set_sat_tipos(pretensao: str, keys: list[str]) -> dict:
         d = raw.get("sat_tipos_por_pretensao")
         if not isinstance(d, dict):
             d = {}
+        # remove qualquer chave existente que seja a MESMA pretensão só com outra caixa
+        # (maiúsculas/minúsculas) — evita acumular duplicatas (pedido do usuário,
+        # 2026-11-17, mesmo caso do bug de `resolver_sat_tipos`).
+        alvo = _norm_pretensao(pretensao)
+        for k in [k for k in d if k != pretensao and _norm_pretensao(k) == alvo]:
+            del d[k]
         d[pretensao] = keys
         raw["sat_tipos_por_pretensao"] = d
     _salvar_raw(raw)
@@ -270,13 +276,25 @@ def set_sat_tipos(pretensao: str, keys: list[str]) -> dict:
             "instituidor": raw.get("sat_tipos_instituidor")}
 
 
+def _norm_pretensao(s: str) -> str:
+    """Normaliza para casar pretensões independente de caixa — o SISDPU nem sempre
+    devolve a pretensão em MAIÚSCULAS (ex.: 'Aposentadoria por idade' em vez de
+    'APOSENTADORIA POR IDADE'), e a comparação era sensível a caixa — bug identificado
+    2026-11-17: PAJ com a pretensão em outra caixa caía no padrão (sem PAT) mesmo com
+    associação cadastrada para aquela pretensão."""
+    return (s or "").strip().upper()
+
+
 def resolver_sat_tipos(pretensao: str, todos: list[str]) -> list[str]:
     """Keys a baixar p/ a pretensão: específica > padrão > todos. Lista vazia
-    configurada (usuário desmarcou tudo) é respeitada."""
-    pretensao = (pretensao or "").strip()
+    configurada (usuário desmarcou tudo) é respeitada. Casamento da pretensão é
+    insensível a maiúsculas/minúsculas (ver `_norm_pretensao`)."""
+    pretensao_norm = _norm_pretensao(pretensao)
     por = get_sat_tipos_por_pretensao()
-    if pretensao and pretensao in por:
-        return por[pretensao]
+    if pretensao_norm:
+        for k, v in por.items():
+            if _norm_pretensao(k) == pretensao_norm:
+                return v
     pad = get_sat_tipos_padrao()
     return pad if pad is not None else list(todos)
 
@@ -409,6 +427,11 @@ def set_sat_pat_por_pretensao(pretensao: str, servicos: list[str]) -> dict:
     pretensao = (pretensao or "").strip()
     servicos = [str(s).strip() for s in (servicos or []) if str(s).strip()]
     if pretensao:
+        # remove qualquer chave existente que seja a MESMA pretensão só com outra caixa —
+        # evita acumular duplicatas (pedido do usuário, 2026-11-17).
+        alvo = _norm_pretensao(pretensao)
+        for k in [k for k in d if k != pretensao and _norm_pretensao(k) == alvo]:
+            del d[k]
         if servicos:
             d[pretensao] = servicos
         else:
@@ -421,9 +444,12 @@ def set_sat_pat_por_pretensao(pretensao: str, servicos: list[str]) -> dict:
 def resolver_sat_pat_filtro(pretensao: str) -> list[str] | None:
     """Espécies de PAT a baixar p/ a pretensão informada. None = sem associação própria
     configurada — baixa TODAS as espécies não ignoradas (comportamento de hoje,
-    inalterado enquanto o Defensor não associar nada para essa pretensão)."""
-    pretensao = (pretensao or "").strip()
+    inalterado enquanto o Defensor não associar nada para essa pretensão). Casamento da
+    pretensão é insensível a maiúsculas/minúsculas (ver `_norm_pretensao`)."""
+    pretensao_norm = _norm_pretensao(pretensao)
     por = get_sat_pat_por_pretensao()
-    if pretensao and pretensao in por and por[pretensao]:
-        return por[pretensao]
+    if pretensao_norm:
+        for k, v in por.items():
+            if _norm_pretensao(k) == pretensao_norm and v:
+                return v
     return None

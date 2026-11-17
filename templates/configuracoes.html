@@ -956,6 +956,13 @@ const TODAS_PRETENSOES_SISDPU = [
     'SALÁRIO-MATERNIDADE',
 ];
 
+// Normaliza uma pretensão p/ comparar/deduplicar independente de caixa (maiúsculas/
+// minúsculas) — o SISDPU nem sempre devolve em CAIXA ALTA. Mesmo critério do backend
+// (`services.config_service._norm_pretensao`) — pedido do usuário, 2026-11-17.
+function _normPret(s) {
+    return (s || '').trim().toUpperCase();
+}
+
 function tiposDocumentos() {
     return {
         catalogo: [], padrao: null, porPretensao: {}, instituidor: null, instituidorDefault: [],
@@ -982,14 +989,20 @@ function tiposDocumentos() {
             } catch (e) {}
             // Lista de pretensões: TODAS as previdenciárias do SISDPU (permite pré-
             // configurar antes de haver PAJ) + as já configuradas + as dos PAJs cadastrados
-            // (cobre eventual pretensão fora da lista fixa).
-            const set = new Set(TODAS_PRETENSOES_SISDPU);
-            Object.keys(this.porPretensao).forEach(p => set.add(p));
+            // (cobre eventual pretensão fora da lista fixa). Deduplicada por `_normPret`
+            // (ignora caixa) — senão a mesma pretensão podia aparecer 2x (uma vinda em
+            // CAIXA ALTA, outra como o SISDPU devolveu p/ aquele PAJ específico). A 1ª
+            // grafia vista (lista fixa > já configuradas > PAJs manuais) é a exibida —
+            // pedido do usuário, 2026-11-17.
+            const canonico = new Map();  // normalizado -> grafia a exibir
+            const addPret = p => { const k = _normPret(p); if (p && !canonico.has(k)) canonico.set(k, p); };
+            TODAS_PRETENSOES_SISDPU.forEach(addPret);
+            Object.keys(this.porPretensao).forEach(addPret);
             try {
                 const p = await (await fetch('/api/sat/pendentes/manuais')).json();
-                (p.itens || []).forEach(it => { if (it.pretensao) set.add(it.pretensao); });
+                (p.itens || []).forEach(it => addPret(it.pretensao));
             } catch (e) {}
-            this.pretensoes = [...set].sort();
+            this.pretensoes = [...canonico.values()].sort();
             this.sel = this._keysParaPret('__padrao__');
             this.patSel = [...(this.patPorPretensao['__padrao__'] || [])];
         },
@@ -997,16 +1010,26 @@ function tiposDocumentos() {
             const g = []; this.catalogo.forEach(t => { if (!g.includes(t.grupo)) g.push(t.grupo); }); return g;
         },
         doGrupo(g) { return this.catalogo.filter(t => t.grupo === g); },
+        // Busca em `mapa` (porPretensao/patPorPretensao) ignorando caixa — mesmo critério
+        // do backend (`resolver_sat_tipos`/`resolver_sat_pat_filtro`), pedido do usuário,
+        // 2026-11-17.
+        _buscarPorPretensao(mapa, pret) {
+            if (Object.prototype.hasOwnProperty.call(mapa, pret)) return mapa[pret];
+            const alvo = _normPret(pret);
+            const k = Object.keys(mapa).find(k => _normPret(k) === alvo);
+            return k !== undefined ? mapa[k] : undefined;
+        },
         _keysParaPret(pret) {
             if (pret === '__instituidor__') {
                 return this.instituidor ? [...this.instituidor] : [...this.instituidorDefault];
             }
-            if (pret !== '__padrao__' && this.porPretensao[pret]) return [...this.porPretensao[pret]];
+            const achado = pret !== '__padrao__' ? this._buscarPorPretensao(this.porPretensao, pret) : undefined;
+            if (achado) return [...achado];
             return this.padrao === null ? this.catalogo.map(t => t.key) : [...this.padrao];
         },
         onPretChange() {
             this.sel = this._keysParaPret(this.pretSel);
-            this.patSel = [...(this.patPorPretensao[this.pretSel] || [])];
+            this.patSel = [...(this._buscarPorPretensao(this.patPorPretensao, this.pretSel) || [])];
         },
         marcarTodos(marcar) { this.sel = marcar ? this.catalogo.map(t => t.key) : []; },
         async salvar() {

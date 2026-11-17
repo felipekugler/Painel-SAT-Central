@@ -6,6 +6,28 @@ Convenção: [SemVer](https://semver.org/) (MAJOR.MINOR.PATCH). O número atual 
 O versionamento começou nesta entrada (1.3.0) — mudanças anteriores a ela não foram
 catalogadas retroativamente.
 
+## [1.9.11] — 2026-11-17
+
+### Alterado
+- Unifica a lista de pretensões em Configurações: antes podia mostrar a mesma pretensão
+  2x (uma em CAIXA ALTA, outra na caixa que o SISDPU devolveu para um PAJ específico) —
+  agora deduplicada por pretensão, ignorando caixa. A busca da associação de tipos/PAT
+  por pretensão na própria tela também passou a ignorar caixa, e salvar uma associação
+  remove qualquer chave antiga da mesma pretensão com outra caixa, em vez de acumular.
+
+## [1.9.10] — 2026-11-17
+
+### Corrigido
+- **Associação de tipos/PAT por pretensão ignorada quando a caixa vinha com outra
+  caixa**: `resolver_sat_tipos`/`resolver_sat_pat_filtro` comparavam a pretensão do PAJ
+  com as chaves configuradas em Configurações de forma sensível a maiúsculas/minúsculas.
+  O SISDPU nem sempre devolve a pretensão em CAIXA ALTA (ex.: "Aposentadoria por idade"
+  em vez de "APOSENTADORIA POR IDADE", como está salvo em Configurações) — quando isso
+  acontecia, o painel caía no conjunto padrão (sem PAT) mesmo havendo associação
+  cadastrada para aquela pretensão, inclusive para as espécies de PAT. Agora a
+  comparação ignora caixa (identificado no PAJ 2026/029-04666, pretensão "Aposentadoria
+  por idade").
+
 ## [1.9.9] — 2026-11-13
 
 ### Alterado
